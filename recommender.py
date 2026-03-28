@@ -481,58 +481,52 @@ async def cleanup_recommendations(
     """Delete recommendation playlist and its tracks from disk.
 
     Tracks that were rated/starred by user are moved to main library instead.
+    Scans _recommendations/ folder directly (does NOT rely on Navidrome paths).
     """
     kept = 0
     deleted = 0
 
     try:
-        # Find the recommendation playlist
-        playlists_resp = await _navidrome_api(
-            navidrome_url, navidrome_user, navidrome_password,
-            "getPlaylists", {},
-        )
-        playlist_id = None
-        for pl in playlists_resp.get("playlists", {}).get("playlist", []):
-            if pl.get("name") == playlist_name:
-                playlist_id = pl["id"]
-                break
-
-        if not playlist_id:
-            return {"status": "no_playlist", "kept": 0, "deleted": 0}
-
-        # Get playlist tracks with their ratings
-        pl_resp = await _navidrome_api(
-            navidrome_url, navidrome_user, navidrome_password,
-            "getPlaylist", {"id": playlist_id},
-        )
-        entries = pl_resp.get("playlist", {}).get("entry", [])
-
         rec_dir = Path(music_dir) / "_recommendations"
-        for entry in entries:
-            starred = entry.get("starred")
-            rating = entry.get("userRating", 0)
-            path_str = entry.get("path", "")
-            title = entry.get("title", "")
-            artist = entry.get("artist", "")
+        if not rec_dir.exists():
+            return {"status": "no_recs_dir", "kept": 0, "deleted": 0}
 
-            # Find the actual file
-            full_path = None
-            if path_str:
-                candidate = Path(music_dir) / path_str
-                if candidate.exists():
-                    full_path = candidate
-            if not full_path:
-                for f in rec_dir.rglob("*.flac"):
-                    try:
-                        audio = FLAC(str(f))
-                        if (audio.get("title") or [""])[0] == title:
-                            full_path = f
-                            break
-                    except Exception:
-                        continue
+        # Collect all FLAC files in _recommendations
+        rec_files = list(rec_dir.rglob("*.flac"))
+        if not rec_files:
+            return {"status": "empty", "kept": 0, "deleted": 0}
 
-            if not full_path or not full_path.exists():
+        # For each file, check if user starred/rated it in Navidrome
+        for fpath in rec_files:
+            try:
+                audio = FLAC(str(fpath))
+                title = (audio.get("title") or [""])[0]
+                artist = (audio.get("artist") or [""])[0]
+            except Exception:
+                # Can't read metadata — delete
+                fpath.unlink(missing_ok=True)
+                deleted += 1
                 continue
+
+            # Search Navidrome for this track
+            query = f"{artist} {title}" if artist else title
+            result = await _navidrome_api(
+                navidrome_url, navidrome_user, navidrome_password,
+                "search3", {"query": query, "songCount": 5, "albumCount": 0, "artistCount": 0},
+            )
+            songs = result.get("searchResult3", {}).get("song", [])
+
+            # Find the matching song (prefer exact match)
+            matched = None
+            for s in songs:
+                if s.get("title", "").lower() == title.lower():
+                    matched = s
+                    break
+            if not matched and songs:
+                matched = songs[0]
+
+            starred = matched.get("starred") if matched else None
+            rating = (matched.get("userRating") or 0) if matched else 0
 
             if starred or rating >= 3:
                 # User liked it — move to main library
@@ -542,20 +536,20 @@ async def cleanup_recommendations(
                 dest_dir.mkdir(parents=True, exist_ok=True)
                 dest = dest_dir / f"{safe_a} - {safe_t}.flac"
                 try:
-                    full_path.rename(dest)
+                    fpath.rename(dest)
                     kept += 1
                     logger.info("[CLEANUP] Kept (rated): %s - %s → %s", artist, title, dest)
                 except Exception:
-                    logger.warning("[CLEANUP] Failed to move: %s", full_path)
+                    logger.warning("[CLEANUP] Failed to move: %s", fpath)
             else:
                 # Not rated — delete
                 try:
-                    full_path.unlink()
+                    fpath.unlink()
                     deleted += 1
                 except Exception:
                     pass
 
-        # Clean up empty _recommendations dir
+        # Clean up empty dirs in _recommendations
         if rec_dir.exists():
             for d in sorted(rec_dir.rglob("*"), reverse=True):
                 if d.is_dir() and not any(d.iterdir()):
@@ -563,11 +557,19 @@ async def cleanup_recommendations(
             if rec_dir.exists() and not any(rec_dir.iterdir()):
                 rec_dir.rmdir()
 
-        # Delete the playlist from Navidrome
-        await _navidrome_api(
+        # Delete the recommendation playlist from Navidrome
+        playlists_resp = await _navidrome_api(
             navidrome_url, navidrome_user, navidrome_password,
-            "deletePlaylist", {"id": playlist_id},
+            "getPlaylists", {},
         )
+        for pl in playlists_resp.get("playlists", {}).get("playlist", []):
+            if pl.get("name") == playlist_name:
+                await _navidrome_api(
+                    navidrome_url, navidrome_user, navidrome_password,
+                    "deletePlaylist", {"id": pl["id"]},
+                )
+                logger.info("[CLEANUP] Deleted playlist: %s", pl["id"])
+
         logger.info("[CLEANUP] Done: kept %d (rated), deleted %d", kept, deleted)
 
     except Exception:
