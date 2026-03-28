@@ -1,0 +1,17 @@
+__pycache__/
+*.pyc
+*.pyo
+.env
+*.egg-info/
+dist/
+build/
+.venv/
+venv/
+*.flac
+*.mp3
+*.wav
+music/
+_recommendations/
+navidrome-data/
+slskd-data/
+.DS_Store

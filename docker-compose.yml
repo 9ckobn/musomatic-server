@@ -1,0 +1,67 @@
+services:
+  music-api:
+    build:
+      context: ./server
+      args:
+        PROXY_URL: ${PROXY_URL:-}
+    container_name: music-api
+    restart: unless-stopped
+    ports:
+      - "8844:8844"
+    environment:
+      MUSIC_DIR: /music
+      SLSKD_URL: http://slskd:5030
+      SLSKD_KEY: ${SLSKD_KEY}
+      PROXY_URL: ${PROXY_URL:-}
+      API_KEY: ${API_KEY:-}
+      UPGRADE_INTERVAL: ${UPGRADE_INTERVAL:-14400}
+      LLM_PROVIDER: ${LLM_PROVIDER:-}
+      LLM_API_KEY: ${LLM_API_KEY:-}
+      LLM_MODEL: ${LLM_MODEL:-}
+      NAVIDROME_URL: http://navidrome:4533
+      NAVIDROME_USER: ${NAVIDROME_USER:-}
+      NAVIDROME_PASSWORD: ${NAVIDROME_PASSWORD:-}
+      RECOMMEND_INTERVAL: ${RECOMMEND_INTERVAL:-0}
+      RECOMMEND_CLEANUP_HOURS: ${RECOMMEND_CLEANUP_HOURS:-24}
+    volumes:
+      - ${MUSIC_DIR:-./music}:/music
+    depends_on:
+      - slskd
+
+  slskd:
+    image: slskd/slskd:latest
+    container_name: slskd
+    restart: unless-stopped
+    ports:
+      - "5030:5030"
+      - "50300:50300"
+    environment:
+      SLSKD_REMOTE_CONFIGURATION: "true"
+      SLSKD_SLSK_LISTEN_PORT: 50300
+      SLSKD_SLSK_USERNAME: ${SLSKD_USERNAME}
+      SLSKD_SLSK_PASSWORD: ${SLSKD_PASSWORD}
+      SLSKD_API_KEY: ${SLSKD_KEY}
+    volumes:
+      - ${MUSIC_DIR:-./music}:/music
+      - slskd-data:/app
+
+  navidrome:
+    image: deluan/navidrome:latest
+    container_name: navidrome
+    restart: unless-stopped
+    ports:
+      - "4533:4533"
+    environment:
+      ND_SCANSCHEDULE: 1m
+      ND_LOGLEVEL: info
+      ND_SESSIONTIMEOUT: 24h
+      ND_ENABLETRANSCODINGCONFIG: "true"
+      ND_ENABLEDOWNLOADS: "true"
+      ND_MUSICFOLDER: /music
+    volumes:
+      - ${MUSIC_DIR:-./music}:/music:ro
+      - navidrome-data:/data
+
+volumes:
+  slskd-data:
+  navidrome-data:
