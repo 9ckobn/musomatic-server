@@ -17,6 +17,8 @@ from mutagen.flac import FLAC
 
 logger = logging.getLogger("recommender")
 
+PROXY_URL = os.getenv("PROXY_URL", "")
+
 # Supported LLM providers
 PROVIDERS = {
     "gemini": {
@@ -41,7 +43,7 @@ PROVIDERS = {
     },
     "openrouter": {
         "url": "https://openrouter.ai/api/v1/chat/completions",
-        "model": "deepseek/deepseek-chat",
+        "model": "nvidia/nemotron-3-super-120b-a12b:free",
         "auth": "Bearer",
     },
 }
@@ -98,34 +100,56 @@ Respond ONLY with a JSON array, no other text:
 [{{"artist": "Artist Name", "title": "Track Title"}}, ...]"""
 
 
+def _llm_client(timeout: int = 90) -> httpx.AsyncClient:
+    """Create httpx client for LLM calls, with optional proxy."""
+    opts = dict(timeout=timeout, follow_redirects=True)
+    if PROXY_URL:
+        opts["proxy"] = PROXY_URL
+    return httpx.AsyncClient(**opts)
+
+
 async def _call_openai_compatible(
-    url: str, model: str, api_key: str, prompt: str, timeout: int = 60,
+    url: str, model: str, api_key: str, prompt: str, timeout: int = 90,
 ) -> str:
     """Call OpenAI-compatible API (OpenAI, DeepSeek, OpenRouter)."""
-    async with httpx.AsyncClient(timeout=timeout) as c:
-        r = await c.post(
-            url,
-            headers={
-                "Authorization": f"Bearer {api_key}",
-                "Content-Type": "application/json",
-            },
-            json={
-                "model": model,
-                "messages": [{"role": "user", "content": prompt}],
-                "temperature": 0.8,
-                "max_tokens": 4096,
-            },
-        )
-        r.raise_for_status()
-        data = r.json()
-        return data["choices"][0]["message"]["content"]
+    for attempt in range(3):
+        async with _llm_client(timeout) as c:
+            r = await c.post(
+                url,
+                headers={
+                    "Authorization": f"Bearer {api_key}",
+                    "Content-Type": "application/json",
+                },
+                json={
+                    "model": model,
+                    "messages": [{"role": "user", "content": prompt}],
+                    "temperature": 0.8,
+                    "max_tokens": 4096,
+                },
+            )
+            if r.status_code == 429:
+                wait = (attempt + 1) * 20
+                logger.warning("OpenAI-compatible API rate limited, retry in %ds (attempt %d/3)", wait, attempt + 1)
+                await asyncio.sleep(wait)
+                continue
+            r.raise_for_status()
+            data = r.json()
+            content = data.get("choices", [{}])[0].get("message", {}).get("content")
+            if content:
+                return content
+            # Log unexpected response
+            logger.error("LLM returned empty content: %s", json.dumps(data)[:500])
+            if data.get("error"):
+                raise ValueError(f"LLM error: {data['error']}")
+            await asyncio.sleep(10)
+    raise ValueError("LLM returned empty content after 3 attempts")
 
 
 async def _call_claude(
-    url: str, model: str, api_key: str, prompt: str, timeout: int = 60,
+    url: str, model: str, api_key: str, prompt: str, timeout: int = 90,
 ) -> str:
     """Call Anthropic Claude API."""
-    async with httpx.AsyncClient(timeout=timeout) as c:
+    async with _llm_client(timeout) as c:
         r = await c.post(
             url,
             headers={
@@ -145,26 +169,33 @@ async def _call_claude(
 
 
 async def _call_gemini(
-    url: str, model: str, api_key: str, prompt: str, timeout: int = 60,
+    url: str, model: str, api_key: str, prompt: str, timeout: int = 90,
 ) -> str:
-    """Call Google Gemini API (free tier)."""
+    """Call Google Gemini API (free tier) with retry on 429."""
     endpoint = url.replace("{model}", model)
-    async with httpx.AsyncClient(timeout=timeout) as c:
-        r = await c.post(
-            endpoint,
-            params={"key": api_key},
-            headers={"Content-Type": "application/json"},
-            json={
-                "contents": [{"parts": [{"text": prompt}]}],
-                "generationConfig": {
-                    "temperature": 0.8,
-                    "maxOutputTokens": 4096,
+    for attempt in range(5):
+        async with _llm_client(timeout) as c:
+            r = await c.post(
+                endpoint,
+                params={"key": api_key},
+                headers={"Content-Type": "application/json"},
+                json={
+                    "contents": [{"parts": [{"text": prompt}]}],
+                    "generationConfig": {
+                        "temperature": 0.8,
+                        "maxOutputTokens": 4096,
+                    },
                 },
-            },
-        )
-        r.raise_for_status()
-        data = r.json()
-        return data["candidates"][0]["content"]["parts"][0]["text"]
+            )
+            if r.status_code == 429:
+                wait = (attempt + 1) * 30  # 30, 60, 90, 120, 150s
+                logger.warning("Gemini rate limited, retry in %ds (attempt %d/5)", wait, attempt + 1)
+                await asyncio.sleep(wait)
+                continue
+            r.raise_for_status()
+            data = r.json()
+            return data["candidates"][0]["content"]["parts"][0]["text"]
+    raise httpx.HTTPStatusError("Gemini rate limit exceeded after 5 retries", request=r.request, response=r)
 
 
 async def get_recommendations(
