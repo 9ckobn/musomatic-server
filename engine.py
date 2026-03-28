@@ -1156,3 +1156,98 @@ async def upgrade_download(
             return dl
 
     return None
+
+
+# ─── Library Retag ───────────────────────────────────────────────
+
+async def retag_library(music_dir: str, on_progress=None) -> dict:
+    """Scan all FLAC files, find those missing metadata, fetch from Tidal and retag.
+
+    Returns stats: {total, scanned, retagged, failed, skipped, details[]}.
+    """
+    music_path = Path(music_dir)
+    flacs = sorted(music_path.rglob("*.flac"))
+    total = len(flacs)
+    retagged, failed, skipped = 0, 0, 0
+    details = []
+
+    for idx, fpath in enumerate(flacs):
+        try:
+            audio = FLAC(str(fpath))
+            artist = (audio.get("artist") or [""])[0]
+            title = (audio.get("title") or [""])[0]
+
+            if not artist or not title:
+                skipped += 1
+                details.append({"file": fpath.name, "status": "skipped", "reason": "no artist/title"})
+                continue
+
+            # Check if already has full metadata
+            has_date = bool(audio.get("date"))
+            has_tracknum = bool(audio.get("tracknumber"))
+            has_isrc = bool(audio.get("isrc"))
+
+            if has_date and has_tracknum and has_isrc:
+                skipped += 1
+                continue
+
+            # Search Tidal for this track
+            query = _clean_query(artist, title)
+            async with _proxy_client(timeout=15) as c:
+                results = await tidal_search(c, query, limit=5, verify_quality=False)
+
+            if not results:
+                failed += 1
+                details.append({"file": fpath.name, "status": "not_found", "query": query})
+                continue
+
+            # Find best matching result
+            best = None
+            for r in results:
+                a_match = _fuzzy_match(r.artist, artist)
+                t_match = _fuzzy_match(r.title, title)
+                if a_match >= 0.3 and t_match >= 0.5:
+                    if not _is_non_original(title, r.title, r.version, r.album):
+                        best = r
+                        break
+            if not best:
+                best = results[0]
+
+            # Fetch full metadata
+            meta = await _fetch_track_meta(best.track_id)
+            if not meta:
+                failed += 1
+                details.append({"file": fpath.name, "status": "meta_fail", "track_id": best.track_id})
+                continue
+
+            # Apply metadata, keeping existing cover if present
+            cover = meta.pop("cover_data", None)
+            existing_cover = len(audio.pictures) > 0
+
+            tag_flac(
+                str(fpath),
+                artist=artist,
+                title=title,
+                album=meta.get("album") or (audio.get("album") or [""])[0],
+                cover_data=cover if not existing_cover else None,
+                extra_meta=meta,
+            )
+            retagged += 1
+            details.append({
+                "file": fpath.name, "status": "retagged",
+                "added": [k for k in ("date", "tracknumber", "isrc", "copyright", "discnumber")
+                          if meta.get(k) and not audio.get(k.upper())],
+            })
+
+        except Exception as e:
+            failed += 1
+            details.append({"file": fpath.name, "status": "error", "error": str(e)})
+
+        if on_progress and ((idx + 1) % 5 == 0 or idx + 1 == total):
+            on_progress(idx + 1, total, retagged)
+
+    return {
+        "total": total, "scanned": total,
+        "retagged": retagged, "failed": failed, "skipped": skipped,
+        "details": details,
+    }

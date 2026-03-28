@@ -19,6 +19,7 @@ from pydantic import BaseModel
 from engine import (
     search_batch, download_track, UnifiedResult, DownloadResult,
     upgrade_scan, upgrade_download, _is_non_original, _normalize_for_match,
+    retag_library,
 )
 from recommender import (
     get_recommendations, create_navidrome_playlist, cleanup_recommendations,
@@ -600,6 +601,34 @@ async def trigger_cleanup():
         MUSIC_DIR, NAVIDROME_URL, NAVIDROME_USER, NAVIDROME_PASSWORD,
     )
     return result
+
+
+# ─── Library Retag ───────────────────────────────────────────────
+
+@app.post("/retag")
+async def retag_all(bg: BackgroundTasks):
+    """Re-scan library and fill missing metadata from Tidal."""
+    _cleanup_jobs()
+    job_id = f"retag-{int(time.time())}"
+    _jobs[job_id] = {
+        "status": "running", "started": time.time(),
+        "progress": 0, "total": 0, "retagged": 0,
+    }
+
+    async def _run_retag():
+        try:
+            def on_progress(done, total, retagged):
+                _jobs[job_id].update(progress=done, total=total, retagged=retagged)
+            result = await retag_library(MUSIC_DIR, on_progress=on_progress)
+            _jobs[job_id].update(status="done", **result)
+            logger.info("Retag complete: %d retagged, %d failed, %d skipped out of %d",
+                        result["retagged"], result["failed"], result["skipped"], result["total"])
+        except Exception as e:
+            _jobs[job_id].update(status="error", error=str(e))
+            logger.error("Retag failed: %s", e, exc_info=True)
+
+    bg.add_task(_run_retag)
+    return {"job_id": job_id, "status": "running"}
 
 
 @app.post("/jobs/{job_id}/cancel")
