@@ -839,9 +839,12 @@ async def _recommend_job(job_id: str, provider: str, api_key: str, model: str, c
             except Exception:
                 pass
 
-        # Step 4: Create Navidrome playlist
+        # Step 4: Create Navidrome playlist (wait for scan to index new files)
         playlist_id = None
         if downloaded_paths and NAVIDROME_USER and NAVIDROME_PASSWORD:
+            # Navidrome scans every 1m, wait for it to pick up new files
+            logger.info("Waiting 75s for Navidrome to index %d new tracks...", len(downloaded_paths))
+            await asyncio.sleep(75)
             playlist_id = await create_navidrome_playlist(
                 NAVIDROME_URL, NAVIDROME_USER, NAVIDROME_PASSWORD,
                 downloaded_paths, MUSIC_DIR,
