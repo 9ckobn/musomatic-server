@@ -372,21 +372,27 @@ async def get_recommendations(
 async def _navidrome_api(
     base_url: str, user: str, password: str,
     endpoint: str, params: dict | None = None,
+    list_params: list[tuple[str, str]] | None = None,
 ) -> dict:
-    """Call Navidrome's Subsonic API."""
+    """Call Navidrome's Subsonic API.
+    
+    Use list_params for repeated params like songId (Subsonic needs ?songId=a&songId=b).
+    """
     import hashlib
     salt = os.urandom(6).hex()
     token = hashlib.md5(f"{password}{salt}".encode()).hexdigest()
 
-    base_params = {
-        "u": user, "t": token, "s": salt,
-        "v": "1.16.1", "c": "musomatic", "f": "json",
-    }
+    query_pairs = [
+        ("u", user), ("t", token), ("s", salt),
+        ("v", "1.16.1"), ("c", "musomatic"), ("f", "json"),
+    ]
     if params:
-        base_params.update(params)
+        query_pairs.extend(params.items())
+    if list_params:
+        query_pairs.extend(list_params)
 
     async with httpx.AsyncClient(timeout=30) as c:
-        r = await c.get(f"{base_url}/rest/{endpoint}", params=base_params)
+        r = await c.get(f"{base_url}/rest/{endpoint}", params=query_pairs)
         r.raise_for_status()
         data = r.json()
         return data.get("subsonic-response", data)
@@ -426,6 +432,8 @@ async def create_navidrome_playlist(
             songs = result.get("searchResult3", {}).get("song", [])
             if songs:
                 song_ids.append(songs[0]["id"])
+            else:
+                logger.warning("[RECOMMEND] Track not found in Navidrome: %s", query)
 
         if not song_ids:
             logger.warning("[RECOMMEND] No tracks matched in Navidrome")
@@ -444,14 +452,13 @@ async def create_navidrome_playlist(
                 )
                 logger.info("[RECOMMEND] Deleted old playlist: %s", pl["id"])
 
-        # Create new playlist with songs
-        params = {"name": playlist_name}
-        for i, sid in enumerate(song_ids):
-            params[f"songId[{i}]"] = sid  # Subsonic API uses indexed params
+        # Create new playlist with songs using repeated songId params
+        song_id_pairs = [("songId", sid) for sid in song_ids]
 
         result = await _navidrome_api(
             navidrome_url, navidrome_user, navidrome_password,
-            "createPlaylist", params,
+            "createPlaylist", {"name": playlist_name},
+            list_params=song_id_pairs,
         )
 
         playlist = result.get("playlist", {})
