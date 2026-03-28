@@ -338,24 +338,48 @@ class DownloadResult:
 
 # ─── FLAC Metadata Tagging ──────────────────────────────────────
 
-async def _fetch_cover(track_id: str) -> bytes | None:
+async def _fetch_track_meta(track_id: str) -> dict:
+    """Fetch full track metadata + cover from Tidal.
+
+    Returns dict with: cover_data, date, tracknumber, discnumber,
+    isrc, copyright, duration, explicit, artists (list).
+    """
+    meta = {}
     try:
         async with _proxy_client(timeout=15) as c:
             r = await c.get(f"{MONOCHROME_API}/info/", params={"id": track_id})
             if r.status_code != 200:
-                return None
+                return meta
             data = r.json().get("data", {})
+
+            # Extract metadata fields
+            meta["date"] = (data.get("streamStartDate") or "")[:10]  # "2018-05-29"
+            meta["tracknumber"] = str(data.get("trackNumber", ""))
+            meta["discnumber"] = str(data.get("volumeNumber", ""))
+            meta["isrc"] = data.get("isrc", "")
+            meta["copyright"] = data.get("copyright", "")
+            meta["explicit"] = "1" if data.get("explicit") else ""
+            meta["bpm"] = str(data.get("bpm", "")) if data.get("bpm") else ""
+
+            # All artists
+            artists = data.get("artists", [])
+            if artists:
+                meta["artists"] = [a.get("name", "") for a in artists if a.get("name")]
+
+            # Album info
             album = data.get("album", {})
+            meta["album"] = album.get("title", "")
+
+            # Cover art
             cover_id = album.get("cover", "")
-            if not cover_id:
-                return None
-            cover_url = f"https://resources.tidal.com/images/{cover_id.replace('-', '/')}/1280x1280.jpg"
-            resp = await c.get(cover_url)
-            if resp.status_code == 200 and len(resp.content) > 1000:
-                return resp.content
+            if cover_id:
+                cover_url = f"https://resources.tidal.com/images/{cover_id.replace('-', '/')}/1280x1280.jpg"
+                resp = await c.get(cover_url)
+                if resp.status_code == 200 and len(resp.content) > 1000:
+                    meta["cover_data"] = resp.content
     except Exception:
-        logger.warning("Failed to fetch cover for track %s", track_id, exc_info=True)
-    return None
+        logger.warning("Failed to fetch metadata for track %s", track_id, exc_info=True)
+    return meta
 
 
 def tag_flac(
@@ -364,7 +388,13 @@ def tag_flac(
     title: str = "",
     album: str = "",
     cover_data: bytes | None = None,
+    extra_meta: dict | None = None,
 ):
+    """Tag FLAC file with metadata.
+
+    extra_meta can contain: date, tracknumber, discnumber, isrc,
+    copyright, explicit, bpm, artists (list).
+    """
     try:
         audio = FLAC(path)
         if artist:
@@ -374,6 +404,26 @@ def tag_flac(
             audio["TITLE"] = title
         if album:
             audio["ALBUM"] = album
+
+        if extra_meta:
+            if extra_meta.get("date"):
+                audio["DATE"] = extra_meta["date"]
+                year = extra_meta["date"][:4]
+                if year.isdigit():
+                    audio["YEAR"] = year
+            if extra_meta.get("tracknumber"):
+                audio["TRACKNUMBER"] = extra_meta["tracknumber"]
+            if extra_meta.get("discnumber"):
+                audio["DISCNUMBER"] = extra_meta["discnumber"]
+            if extra_meta.get("isrc"):
+                audio["ISRC"] = extra_meta["isrc"]
+            if extra_meta.get("copyright"):
+                audio["COPYRIGHT"] = extra_meta["copyright"]
+            # Multiple artists
+            if extra_meta.get("artists") and len(extra_meta["artists"]) > 1:
+                audio["ARTIST"] = extra_meta["artists"]
+                audio["ALBUMARTIST"] = extra_meta["artists"][0]
+
         if cover_data:
             pic = Picture()
             pic.type = 3
@@ -566,21 +616,17 @@ async def tidal_download(
     import tempfile
 
     async with _proxy_client(timeout=httpx.Timeout(180, connect=30)) as c:
-        tidal_info = {}
-        try:
-            r = await c.get(f"{MONOCHROME_API}/info/", params={"id": track_id})
-            if r.status_code == 200:
-                tidal_info = r.json().get("data", {})
-        except Exception:
-            pass
+        # Fetch full metadata (cover, date, tracknumber, ISRC, etc.)
+        track_meta = await _fetch_track_meta(track_id)
 
         if not artist:
-            artist = tidal_info.get("artist", {}).get("name", "Unknown")
+            artist = track_meta.get("artists", ["Unknown"])[0] if track_meta.get("artists") else "Unknown"
         if not title:
-            title = tidal_info.get("title", "Unknown")
+            title = track_meta.get("title", "Unknown")
         if not album:
-            album = tidal_info.get("album", {}).get("title", "")
+            album = track_meta.get("album", "")
 
+        cover_data = track_meta.pop("cover_data", None)
         fpath = _organize_path(output_dir, artist, title)
 
         for q in ([quality] if quality == "LOSSLESS" else [quality, "LOSSLESS"]):
@@ -595,8 +641,8 @@ async def tidal_download(
                             async for chunk in resp.aiter_bytes(65536):
                                 f.write(chunk)
                     if Path(fpath).stat().st_size > 1000:
-                        cover = await _fetch_cover(track_id)
-                        tag_flac(fpath, artist=artist, title=title, album=album, cover_data=cover)
+                        tag_flac(fpath, artist=artist, title=title, album=album,
+                                 cover_data=cover_data, extra_meta=track_meta)
                         return DownloadResult(
                             path=fpath, bit_depth=stream["bit_depth"],
                             sample_rate=stream["sample_rate"],
@@ -627,8 +673,8 @@ async def tidal_download(
                     )
                     Path(tmp_path).unlink(missing_ok=True)
                     if result.returncode == 0 and Path(fpath).stat().st_size > 1000:
-                        cover = await _fetch_cover(track_id)
-                        tag_flac(fpath, artist=artist, title=title, album=album, cover_data=cover)
+                        tag_flac(fpath, artist=artist, title=title, album=album,
+                                 cover_data=cover_data, extra_meta=track_meta)
                         return DownloadResult(
                             path=fpath, bit_depth=stream["bit_depth"],
                             sample_rate=stream["sample_rate"],

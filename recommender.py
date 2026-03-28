@@ -19,6 +19,11 @@ logger = logging.getLogger("recommender")
 
 # Supported LLM providers
 PROVIDERS = {
+    "gemini": {
+        "url": "https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent",
+        "model": "gemini-2.0-flash",
+        "auth": "query",  # API key in URL param
+    },
     "openai": {
         "url": "https://api.openai.com/v1/chat/completions",
         "model": "gpt-4o-mini",
@@ -139,6 +144,29 @@ async def _call_claude(
         return data["content"][0]["text"]
 
 
+async def _call_gemini(
+    url: str, model: str, api_key: str, prompt: str, timeout: int = 60,
+) -> str:
+    """Call Google Gemini API (free tier)."""
+    endpoint = url.replace("{model}", model)
+    async with httpx.AsyncClient(timeout=timeout) as c:
+        r = await c.post(
+            endpoint,
+            params={"key": api_key},
+            headers={"Content-Type": "application/json"},
+            json={
+                "contents": [{"parts": [{"text": prompt}]}],
+                "generationConfig": {
+                    "temperature": 0.8,
+                    "maxOutputTokens": 4096,
+                },
+            },
+        )
+        r.raise_for_status()
+        data = r.json()
+        return data["candidates"][0]["content"]["parts"][0]["text"]
+
+
 async def get_recommendations(
     music_dir: str,
     provider: str,
@@ -170,6 +198,8 @@ async def get_recommendations(
     # Call LLM
     if provider == "claude":
         raw = await _call_claude(config["url"], use_model, api_key, prompt)
+    elif provider == "gemini":
+        raw = await _call_gemini(config["url"], use_model, api_key, prompt)
     else:
         raw = await _call_openai_compatible(config["url"], use_model, api_key, prompt)
 
