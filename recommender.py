@@ -48,9 +48,32 @@ PROVIDERS = {
     },
 }
 
-RECOMMEND_COUNT = int(os.getenv("RECOMMEND_COUNT", "30"))
+RECOMMEND_COUNT = int(os.getenv("RECOMMEND_COUNT", "40"))
 RECOMMEND_PLAYLIST = "AI Recommendations"
 RECOMMEND_CLEANUP_HOURS = int(os.getenv("RECOMMEND_CLEANUP_HOURS", "24"))
+RECOMMEND_HISTORY_FILE = os.getenv("RECOMMEND_HISTORY_FILE", "/music/.recommend_history.json")
+
+# Cooldown range: don't re-recommend a track for 7-21 days (random per track)
+HISTORY_COOLDOWN_MIN = 7 * 86400   # 7 days
+HISTORY_COOLDOWN_MAX = 21 * 86400  # 21 days
+
+
+def _load_history() -> dict:
+    """Load recommendation history. Format: {"artist - title": timestamp}"""
+    try:
+        with open(RECOMMEND_HISTORY_FILE, "r") as f:
+            return json.load(f)
+    except (FileNotFoundError, json.JSONDecodeError):
+        return {}
+
+
+def _save_history(history: dict):
+    """Save recommendation history."""
+    try:
+        with open(RECOMMEND_HISTORY_FILE, "w") as f:
+            json.dump(history, f, ensure_ascii=False, indent=2)
+    except Exception:
+        logger.warning("[RECOMMEND] Failed to save history")
 
 
 def _scan_library_for_ai(music_dir: str) -> list[dict]:
@@ -68,9 +91,10 @@ def _scan_library_for_ai(music_dir: str) -> list[dict]:
     return tracks
 
 
-def _build_prompt(library: list[dict], count: int = 30) -> str:
-    """Build the recommendation prompt."""
-    # Deduplicate and group by artist for a compact representation
+def _build_prompt(library: list[dict], count: int = 30, history: dict | None = None) -> str:
+    """Build the recommendation prompt with diversity emphasis."""
+    import random
+
     by_artist: dict[str, list[str]] = {}
     for t in library:
         by_artist.setdefault(t["artist"], []).append(t["title"])
@@ -80,24 +104,77 @@ def _build_prompt(library: list[dict], count: int = 30) -> str:
         for artist, titles in sorted(by_artist.items())
     )
 
-    return f"""You are a music recommendation engine for an audiophile.
+    # Build "already recommended" exclusion list from history
+    exclude_text = ""
+    if history:
+        now = time.time()
+        active = [k for k, ts in history.items()
+                  if now - ts < HISTORY_COOLDOWN_MAX]
+        if active:
+            sample = random.sample(active, min(len(active), 50))
+            exclude_text = "\n\nDo NOT recommend these (recently suggested):\n" + \
+                           "\n".join(f"- {t}" for t in sample)
 
-Here is the user's current music library:
+    return f"""You are a cutting-edge music discovery AI for an audiophile who's tired of hearing the same songs.
+
+User's library ({len(by_artist)} artists, {sum(len(v) for v in by_artist.values())} tracks):
 
 {lib_text}
 
-Based on this collection, recommend exactly {count} tracks that the user would likely enjoy.
+Generate exactly {count} track recommendations following this MIX:
 
-Rules:
-- Recommend tracks NOT already in the library
-- Match the user's taste: similar genres, energy, era
-- Mix well-known classics with hidden gems
-- Include a variety of artists (don't repeat artists too much)
-- Only recommend tracks that exist and are searchable
-- NO remixes, live versions, covers, or karaoke
+🔥 ~5% ICONIC DEEP CUTS — cult classics that real fans know but aren't overplayed mainstream hits
+🆕 ~40% FRESH DISCOVERIES — released in the last 3 years, across all genres
+📈 ~15% TRENDING NOW — songs currently viral on TikTok, Reels, trending on Spotify/Apple Music in 2024-2025
+🌍 ~20% INTERNATIONAL — non-English: Japanese (J-Rock, J-Pop, City Pop), Korean, French, German, Russian, Scandinavian, Latin American
+🎵 ~20% PERFECT MATCHES — great tracks from any era/genre that match the user's vibe but they probably haven't heard
 
-Respond ONLY with a JSON array, no other text:
-[{{"artist": "Artist Name", "title": "Track Title"}}, ...]"""
+HARD RULES:
+- Maximum 1 track per artist
+- NO tracks already in the user's library
+- NO obvious mega-hits (nothing with 1B+ streams that everyone knows)
+- NO remixes, live versions, covers, karaoke
+- Every track must be a real, released studio recording findable on Tidal/Spotify
+- Include the genre for each track
+{exclude_text}
+
+Respond ONLY with a JSON array:
+[{{"artist": "Artist Name", "title": "Track Title", "genre": "genre tag"}}, ...]"""
+
+
+def _parse_truncated_json(raw: str) -> list[dict]:
+    """Salvage complete JSON objects from a truncated array response."""
+    # Find all complete {...} objects using a simple brace-matching approach
+    results = []
+    i = raw.find('[')
+    if i < 0:
+        return results
+    i += 1
+    while i < len(raw):
+        start = raw.find('{', i)
+        if start < 0:
+            break
+        depth = 0
+        end = start
+        for j in range(start, len(raw)):
+            if raw[j] == '{':
+                depth += 1
+            elif raw[j] == '}':
+                depth -= 1
+                if depth == 0:
+                    end = j + 1
+                    break
+        if depth != 0:
+            break  # incomplete object
+        try:
+            obj = json.loads(raw[start:end])
+            if isinstance(obj, dict) and "artist" in obj and "title" in obj:
+                results.append(obj)
+        except json.JSONDecodeError:
+            pass
+        i = end
+    logger.info("[LLM] Salvaged %d tracks from truncated JSON response", len(results))
+    return results
 
 
 def _llm_client(timeout: int = 90) -> httpx.AsyncClient:
@@ -124,12 +201,13 @@ async def _call_openai_compatible(
                     "model": model,
                     "messages": [{"role": "user", "content": prompt}],
                     "temperature": 0.8,
-                    "max_tokens": 4096,
+                    "max_tokens": 16384,
+                    "reasoning": {"effort": "none"},
                 },
             )
             if r.status_code == 429:
                 wait = (attempt + 1) * 20
-                logger.warning("OpenAI-compatible API rate limited, retry in %ds (attempt %d/3)", wait, attempt + 1)
+                logger.warning("[LLM] Rate limited (OpenAI-compat), retry in %ds (attempt %d/3)", wait, attempt + 1)
                 await asyncio.sleep(wait)
                 continue
             r.raise_for_status()
@@ -138,7 +216,7 @@ async def _call_openai_compatible(
             if content:
                 return content
             # Log unexpected response
-            logger.error("LLM returned empty content: %s", json.dumps(data)[:500])
+            logger.error("[LLM] Empty content: %s", json.dumps(data)[:500])
             if data.get("error"):
                 raise ValueError(f"LLM error: {data['error']}")
             await asyncio.sleep(10)
@@ -159,7 +237,7 @@ async def _call_claude(
             },
             json={
                 "model": model,
-                "max_tokens": 4096,
+                "max_tokens": 16384,
                 "messages": [{"role": "user", "content": prompt}],
             },
         )
@@ -189,7 +267,7 @@ async def _call_gemini(
             )
             if r.status_code == 429:
                 wait = (attempt + 1) * 30  # 30, 60, 90, 120, 150s
-                logger.warning("Gemini rate limited, retry in %ds (attempt %d/5)", wait, attempt + 1)
+                logger.warning("[LLM] Gemini rate limited, retry in %ds (attempt %d/5)", wait, attempt + 1)
                 await asyncio.sleep(wait)
                 continue
             r.raise_for_status()
@@ -221,10 +299,13 @@ async def get_recommendations(
     if not library:
         raise ValueError("Library is empty — nothing to analyze")
 
-    logger.info("Generating recommendations: %d tracks in library, provider=%s, model=%s",
-                len(library), provider, use_model)
+    # Load recommendation history
+    history = _load_history()
 
-    prompt = _build_prompt(library, use_count)
+    logger.info("[RECOMMEND] Generating: %d tracks in library, %d in history, provider=%s, model=%s",
+                len(library), len(history), provider, use_model)
+
+    prompt = _build_prompt(library, use_count, history)
 
     # Call LLM
     if provider == "claude":
@@ -246,17 +327,43 @@ async def get_recommendations(
         # Try to find JSON array in the response
         match = re.search(r'\[.*\]', raw, re.DOTALL)
         if match:
-            tracks = json.loads(match.group())
+            try:
+                tracks = json.loads(match.group())
+            except json.JSONDecodeError:
+                # Truncated JSON — salvage complete entries
+                tracks = _parse_truncated_json(match.group())
         else:
-            raise ValueError(f"LLM returned invalid JSON: {raw[:200]}")
+            # Maybe truncated — try salvaging from first [
+            idx = raw.find('[')
+            if idx >= 0:
+                tracks = _parse_truncated_json(raw[idx:])
+            else:
+                raise ValueError(f"LLM returned invalid JSON: {raw[:200]}")
 
-    # Validate structure
+    if not tracks:
+        raise ValueError(f"LLM returned no parseable tracks: {raw[:200]}")
+
+    # Validate structure and filter out recently recommended
+    now = time.time()
     valid = []
     for t in tracks:
         if isinstance(t, dict) and "artist" in t and "title" in t:
-            valid.append({"artist": str(t["artist"]), "title": str(t["title"])})
+            key = f"{t['artist']} - {t['title']}"
+            prev_ts = history.get(key, 0)
+            import random
+            cooldown = random.randint(HISTORY_COOLDOWN_MIN, HISTORY_COOLDOWN_MAX)
+            if now - prev_ts > cooldown:
+                entry = {"artist": str(t["artist"]), "title": str(t["title"])}
+                if t.get("genre"):
+                    entry["genre"] = str(t["genre"])
+                valid.append(entry)
 
-    logger.info("Got %d valid recommendations from LLM", len(valid))
+    # Record all recommendations in history
+    for t in valid:
+        history[f"{t['artist']} - {t['title']}"] = now
+    _save_history(history)
+
+    logger.info("[RECOMMEND] Got %d valid recs (%d after history filter)", len(tracks), len(valid))
     return valid[:use_count]
 
 
@@ -321,7 +428,7 @@ async def create_navidrome_playlist(
                 song_ids.append(songs[0]["id"])
 
         if not song_ids:
-            logger.warning("No tracks matched in Navidrome")
+            logger.warning("[RECOMMEND] No tracks matched in Navidrome")
             return None
 
         # Delete existing recommendation playlist if it exists
@@ -335,7 +442,7 @@ async def create_navidrome_playlist(
                     navidrome_url, navidrome_user, navidrome_password,
                     "deletePlaylist", {"id": pl["id"]},
                 )
-                logger.info("Deleted old recommendation playlist: %s", pl["id"])
+                logger.info("[RECOMMEND] Deleted old playlist: %s", pl["id"])
 
         # Create new playlist with songs
         params = {"name": playlist_name}
@@ -349,11 +456,11 @@ async def create_navidrome_playlist(
 
         playlist = result.get("playlist", {})
         pid = playlist.get("id", "")
-        logger.info("Created playlist '%s' with %d tracks (id=%s)", playlist_name, len(song_ids), pid)
+        logger.info("[RECOMMEND] Created playlist '%s' with %d tracks (id=%s)", playlist_name, len(song_ids), pid)
         return pid
 
     except Exception:
-        logger.exception("Failed to create Navidrome playlist")
+        logger.exception("[RECOMMEND] Failed to create playlist")
         return None
 
 
@@ -430,9 +537,9 @@ async def cleanup_recommendations(
                 try:
                     full_path.rename(dest)
                     kept += 1
-                    logger.info("Kept (rated): %s - %s → %s", artist, title, dest)
+                    logger.info("[CLEANUP] Kept (rated): %s - %s → %s", artist, title, dest)
                 except Exception:
-                    logger.warning("Failed to move rated track: %s", full_path)
+                    logger.warning("[CLEANUP] Failed to move: %s", full_path)
             else:
                 # Not rated — delete
                 try:
@@ -454,9 +561,9 @@ async def cleanup_recommendations(
             navidrome_url, navidrome_user, navidrome_password,
             "deletePlaylist", {"id": playlist_id},
         )
-        logger.info("Cleanup done: kept %d (rated), deleted %d", kept, deleted)
+        logger.info("[CLEANUP] Done: kept %d (rated), deleted %d", kept, deleted)
 
     except Exception:
-        logger.exception("Recommendation cleanup failed")
+        logger.exception("[CLEANUP] Failed")
 
     return {"status": "done", "kept": kept, "deleted": deleted}

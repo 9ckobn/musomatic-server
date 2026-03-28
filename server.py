@@ -67,9 +67,9 @@ async def _upgrader_loop():
     while True:
         _upgrade_status["next_run"] = time.time()
         try:
-            logger.info("Upgrade scan starting...")
+            logger.info("[UPGRADE] Scan starting...")
             upgrades = await upgrade_scan(MUSIC_DIR, SLSKD_URL, SLSKD_KEY)
-            logger.info("Upgrade scan found %d candidates", len(upgrades))
+            logger.info("[UPGRADE] Found %d candidates", len(upgrades))
 
             upgraded = 0
             for u in upgrades:
@@ -77,21 +77,21 @@ async def _upgrader_loop():
                     dl = await upgrade_download(u, MUSIC_DIR, SLSKD_URL, SLSKD_KEY)
                     if dl:
                         upgraded += 1
-                        logger.info("Upgraded: %s - %s (%dbit → %dbit)",
+                        logger.info("[UPGRADE] ✅ %s - %s (%dbit → %dbit)",
                                     u["track"]["artist"], u["track"]["title"],
                                     u["track"]["bit_depth"], dl.bit_depth)
                 except Exception:
-                    logger.exception("Failed to upgrade %s", u["track"].get("title"))
+                    logger.exception("[UPGRADE] ❌ Failed: %s", u["track"].get("title"))
                 await asyncio.sleep(5)
 
-            logger.info("Upgrade cycle done: %d/%d upgraded", upgraded, len(upgrades))
+            logger.info("[UPGRADE] Done: %d/%d upgraded", upgraded, len(upgrades))
             _upgrade_status["last_run"] = time.time()
             _upgrade_status["last_result"] = {
                 "candidates": len(upgrades), "upgraded": upgraded,
                 "timestamp": time.time(),
             }
         except Exception:
-            logger.exception("Upgrade scan failed")
+            logger.exception("[UPGRADE] Scan failed")
 
         _upgrade_status["next_run"] = time.time() + UPGRADE_INTERVAL
         await asyncio.sleep(UPGRADE_INTERVAL)
@@ -107,7 +107,7 @@ async def _recommender_loop():
         try:
             await _run_recommendation_cycle()
         except Exception:
-            logger.exception("Recommendation cycle failed")
+            logger.exception("[RECOMMEND] Auto-cycle failed")
         await asyncio.sleep(RECOMMEND_INTERVAL)
 
 
@@ -123,26 +123,26 @@ async def _cleanup_loop():
                 MUSIC_DIR, NAVIDROME_URL, NAVIDROME_USER, NAVIDROME_PASSWORD,
             )
             if result.get("status") == "done":
-                logger.info("Recommendation cleanup: kept %d, deleted %d",
+                logger.info("[CLEANUP] Recommendations: kept %d, deleted %d",
                             result["kept"], result["deleted"])
         except Exception:
-            logger.exception("Recommendation cleanup failed")
+            logger.exception("[CLEANUP] Failed")
         await asyncio.sleep(RECOMMEND_CLEANUP_HOURS * 3600)
 
 
 async def _run_recommendation_cycle():
     """Full recommendation cycle: AI → search → download → playlist."""
-    logger.info("Generating AI recommendations...")
+    logger.info("[RECOMMEND-AUTO] Generating AI recommendations...")
 
     recs = await get_recommendations(
         MUSIC_DIR, LLM_PROVIDER, LLM_API_KEY,
         model=LLM_MODEL or None,
     )
     if not recs:
-        logger.warning("No recommendations from AI")
+        logger.warning("[RECOMMEND-AUTO] No recommendations from AI")
         return
 
-    logger.info("Got %d recommendations, searching & downloading...", len(recs))
+    logger.info("[RECOMMEND-AUTO] Got %d recs, searching & downloading...", len(recs))
 
     # Search all tracks
     results = await search_batch(
@@ -162,9 +162,9 @@ async def _run_recommendation_cycle():
             if dl and dl.path:
                 downloaded_paths.append(dl.path)
         except Exception:
-            logger.warning("Failed to download recommendation: %s - %s", r.artist, r.title)
+            logger.warning("[RECOMMEND-AUTO] ❌ Not found: %s - %s", r.artist, r.title)
 
-    logger.info("Downloaded %d/%d recommendations", len(downloaded_paths), len(recs))
+    logger.info("[RECOMMEND-AUTO] Downloaded %d/%d", len(downloaded_paths), len(recs))
 
     # Create Navidrome playlist
     if downloaded_paths and NAVIDROME_USER and NAVIDROME_PASSWORD:
@@ -173,7 +173,7 @@ async def _run_recommendation_cycle():
             downloaded_paths, MUSIC_DIR,
         )
         if playlist_id:
-            logger.info("Created recommendation playlist: %s", playlist_id)
+            logger.info("[RECOMMEND-AUTO] Playlist created: %s", playlist_id)
 
     _recommend_status["last_run"] = time.time()
     _recommend_status["last_result"] = {
@@ -187,15 +187,15 @@ async def _run_recommendation_cycle():
 async def lifespan(app: FastAPI):
     global _upgrader_task, _recommender_task, _cleanup_task
     _upgrader_task = asyncio.create_task(_upgrader_loop())
-    logger.info("Background upgrader started (interval: %ds)", UPGRADE_INTERVAL)
+    logger.info("[STARTUP] Background upgrader (interval: %ds)", UPGRADE_INTERVAL)
 
     if RECOMMEND_INTERVAL > 0 and LLM_PROVIDER and LLM_API_KEY:
         _recommender_task = asyncio.create_task(_recommender_loop())
         _recommend_status["enabled"] = True
-        logger.info("AI recommender started (interval: %ds, provider: %s)", RECOMMEND_INTERVAL, LLM_PROVIDER)
+        logger.info("[STARTUP] AI recommender (interval: %ds, provider: %s)", RECOMMEND_INTERVAL, LLM_PROVIDER)
     if NAVIDROME_USER and NAVIDROME_PASSWORD:
         _cleanup_task = asyncio.create_task(_cleanup_loop())
-        logger.info("Recommendation cleanup started (every %dh)", RECOMMEND_CLEANUP_HOURS)
+        logger.info("[STARTUP] Recommendation cleanup (every %dh)", RECOMMEND_CLEANUP_HOURS)
 
     yield
     for task in [_upgrader_task, _recommender_task, _cleanup_task]:
@@ -355,7 +355,7 @@ async def quick_download(req: QuickDownload):
     if not title:
         raise HTTPException(400, "Empty query")
 
-    logger.info("Quick download: %s - %s", artist or "?", title)
+    logger.info("[QUICK-DL] %s - %s", artist or "?", title)
     t0 = time.time()
 
     results = await search_batch(
@@ -621,11 +621,11 @@ async def retag_all(bg: BackgroundTasks):
                 _jobs[job_id].update(progress=done, total=total, retagged=retagged)
             result = await retag_library(MUSIC_DIR, on_progress=on_progress)
             _jobs[job_id].update(status="done", **result)
-            logger.info("Retag complete: %d retagged, %d failed, %d skipped out of %d",
+            logger.info("[RETAG] Complete: %d retagged, %d failed, %d skipped out of %d",
                         result["retagged"], result["failed"], result["skipped"], result["total"])
         except Exception as e:
             _jobs[job_id].update(status="error", error=str(e))
-            logger.error("Retag failed: %s", e, exc_info=True)
+            logger.error("[RETAG] Failed: %s", e, exc_info=True)
 
     bg.add_task(_run_retag)
     return {"job_id": job_id, "status": "running"}
@@ -712,7 +712,7 @@ async def _download_job(job_id: str, artist: str, title: str):
             job.update(status="failed", error="All download sources failed")
     except Exception as e:
         job.update(status="failed", error=str(e))
-        logger.exception("Job %s failed", job_id)
+        logger.exception("[BATCH] Job %s failed", job_id)
     finally:
         _cancel_events.pop(job_id, None)
 
@@ -760,7 +760,7 @@ async def _batch_job(job_id: str, tracks: list[TrackQuery]):
                 failed += 1
         except Exception:
             failed += 1
-            logger.exception("Batch %s: exception at track %d", job_id, i)
+            logger.exception("[BATCH] %s: exception at track %d", job_id, i)
         job.update(downloaded=downloaded, failed=failed)
 
     _invalidate_caches()
@@ -820,10 +820,17 @@ async def _recommend_job(job_id: str, provider: str, api_key: str, model: str, c
             job.update(status="done", message="No recommendations generated")
             return
 
-        # Step 2: Search all tracks
+        # Step 2: Build genre map from AI response
+        genre_map = {}
+        for rec in recs:
+            key = f"{rec.get('artist','')} - {rec.get('title','')}"
+            if rec.get("genre"):
+                genre_map[key] = rec["genre"]
+
+        # Step 3: Search all tracks
         results = await search_batch(recs, slskd_url=SLSKD_URL, slskd_key=SLSKD_KEY)
 
-        # Step 3: Download to _recommendations dir
+        # Step 4: Download to _recommendations dir
         rec_dir = os.path.join(MUSIC_DIR, "_recommendations")
         os.makedirs(rec_dir, exist_ok=True)
 
@@ -836,6 +843,12 @@ async def _recommend_job(job_id: str, provider: str, api_key: str, model: str, c
                 if dl and dl.path:
                     downloaded_paths.append(dl.path)
                     job["downloaded"] = len(downloaded_paths)
+                    # Tag genre from AI
+                    key = f"{r.artist} - {r.title}"
+                    genre = genre_map.get(key, "")
+                    if genre:
+                        from engine import tag_flac as _tag
+                        _tag(dl.path, extra_meta={"genre": genre})
             except Exception:
                 pass
 
@@ -843,7 +856,7 @@ async def _recommend_job(job_id: str, provider: str, api_key: str, model: str, c
         playlist_id = None
         if downloaded_paths and NAVIDROME_USER and NAVIDROME_PASSWORD:
             # Navidrome scans every 1m, wait for it to pick up new files
-            logger.info("Waiting 75s for Navidrome to index %d new tracks...", len(downloaded_paths))
+            logger.info("[RECOMMEND] Waiting 75s for Navidrome to index %d new tracks...", len(downloaded_paths))
             await asyncio.sleep(75)
             playlist_id = await create_navidrome_playlist(
                 NAVIDROME_URL, NAVIDROME_USER, NAVIDROME_PASSWORD,
@@ -866,11 +879,11 @@ async def _recommend_job(job_id: str, provider: str, api_key: str, model: str, c
             playlist_id=playlist_id,
             elapsed_s=round(time.time() - job["started"], 1),
         )
-        logger.info("Recommendations done: %d/%d downloaded, playlist=%s",
+        logger.info("[RECOMMEND] Done: %d/%d downloaded, playlist=%s",
                      len(downloaded_paths), len(recs), playlist_id)
     except Exception as e:
         job.update(status="failed", error=str(e))
-        logger.exception("Recommendation job %s failed", job_id)
+        logger.exception("[RECOMMEND] Job %s failed", job_id)
 
 
 def _count_flacs() -> int:

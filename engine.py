@@ -336,6 +336,42 @@ class DownloadResult:
         }
 
 
+# ─── MusicBrainz Genre Lookup ────────────────────────────────────
+
+_MB_GENRE_CACHE: dict[str, str] = {}
+
+async def _fetch_genre_musicbrainz(artist: str) -> str:
+    """Fetch genre tags from MusicBrainz by artist name. Cached per artist."""
+    if artist in _MB_GENRE_CACHE:
+        return _MB_GENRE_CACHE[artist]
+    try:
+        async with httpx.AsyncClient(timeout=10) as c:
+            r = await c.get(
+                "https://musicbrainz.org/ws/2/artist",
+                params={"query": artist, "limit": 1, "fmt": "json"},
+                headers={"User-Agent": "musomatic/1.0 (https://github.com/9ckobn/musomatic-server)"},
+            )
+            if r.status_code == 200:
+                artists = r.json().get("artists", [])
+                if artists:
+                    tags = artists[0].get("tags", [])
+                    # Sort by count (most voted), take top genre-like tags
+                    genre_tags = sorted(tags, key=lambda t: t.get("count", 0), reverse=True)
+                    # Filter out non-genre tags (country names, etc.)
+                    skip = {"american", "usa", "british", "uk", "américain", "united states",
+                            "japanese", "german", "swedish", "korean", "french", "russian",
+                            "rock and indie", "seen live", "favorites"}
+                    genres = [t["name"] for t in genre_tags
+                              if t.get("name", "").lower() not in skip][:3]
+                    result = "; ".join(genres) if genres else ""
+                    _MB_GENRE_CACHE[artist] = result
+                    return result
+    except Exception:
+        pass
+    _MB_GENRE_CACHE[artist] = ""
+    return ""
+
+
 # ─── FLAC Metadata Tagging ──────────────────────────────────────
 
 async def _fetch_track_meta(track_id: str) -> dict:
@@ -419,6 +455,8 @@ def tag_flac(
                 audio["ISRC"] = extra_meta["isrc"]
             if extra_meta.get("copyright"):
                 audio["COPYRIGHT"] = extra_meta["copyright"]
+            if extra_meta.get("genre"):
+                audio["GENRE"] = extra_meta["genre"]
             # Multiple artists
             if extra_meta.get("artists") and len(extra_meta["artists"]) > 1:
                 audio["ARTIST"] = extra_meta["artists"]
@@ -956,7 +994,7 @@ async def download_track(
     check_title = orig_title if orig_artist else (ranked[0].title if ranked else orig_title)
     existing = _find_existing(music_dir, check_artist, check_title)
     if existing:
-        logger.info("Dedup: already exists — %s", existing)
+        logger.info("[DEDUP] already exists — %s", existing)
         bd, sr = 16, 44100
         try:
             info = FLAC(existing).info
@@ -1057,7 +1095,7 @@ async def upgrade_scan(
     if not tracks_16 or not slskd_url or not slskd_key:
         return upgrades
 
-    logger.info("Upgrade scan: %d tracks at 16-bit", len(tracks_16))
+    logger.info("[UPGRADE] Scan: %d tracks at 16-bit", len(tracks_16))
 
     async with httpx.AsyncClient(
         base_url=slskd_url.rstrip("/"),
@@ -1083,7 +1121,7 @@ async def upgrade_scan(
                         continue
 
                     upgrades.append({"track": track, "upgrade": r, "index": i})
-                    logger.info("Upgrade candidate: %s - %s  %dbit→%dbit (%dkHz)",
+                    logger.info("[UPGRADE] Candidate: %s - %s  %dbit→%dbit (%dkHz)",
                                 track["artist"], track["title"],
                                 track["bit_depth"], r.bit_depth, r.sample_rate // 1000)
                     break
@@ -1091,14 +1129,14 @@ async def upgrade_scan(
                 if on_progress:
                     on_progress(i + 1, len(tracks_16))
                 if (i + 1) % 10 == 0:
-                    logger.info("Upgrade scan progress: %d/%d scanned, %d candidates",
+                    logger.info("[UPGRADE] Progress: %d/%d scanned, %d candidates",
                                 i + 1, len(tracks_16), len(upgrades))
             except Exception:
-                logger.warning("Upgrade scan failed for %s - %s", track['artist'], track['title'], exc_info=True)
+                logger.warning("[UPGRADE] Scan failed for %s - %s", track['artist'], track['title'], exc_info=True)
                 continue
             await asyncio.sleep(2)
 
-    logger.info("Upgrade scan done: %d/%d candidates found", len(upgrades), len(tracks_16))
+    logger.info("[UPGRADE] Scan done: %d/%d candidates found", len(upgrades), len(tracks_16))
     return upgrades
 
 
@@ -1133,12 +1171,12 @@ async def upgrade_download(
                 audio = FLACVerify(dl.path)
                 actual_bd = audio.info.bits_per_sample
                 if actual_bd < 24:
-                    logger.warning("Upgrade for %s - %s: claimed 24-bit but got %d-bit, keeping original",
+                    logger.warning("[UPGRADE] %s - %s: claimed 24-bit but got %d-bit, keeping original",
                                    track["artist"], track["title"], actual_bd)
                     Path(dl.path).unlink(missing_ok=True)
                     return None
             except Exception:
-                logger.warning("Upgrade for %s - %s: couldn't verify quality",
+                logger.warning("[UPGRADE] %s - %s: couldn't verify quality",
                                track["artist"], track["title"])
                 Path(dl.path).unlink(missing_ok=True)
                 return None
@@ -1151,7 +1189,7 @@ async def upgrade_download(
             except Exception:
                 pass
 
-            logger.info("Upgraded %s - %s: %dbit → %dbit",
+            logger.info("[UPGRADE] ✅ Upgraded %s - %s: %dbit → %dbit",
                         track["artist"], track["title"], track["bit_depth"], actual_bd)
             return dl
 
@@ -1161,7 +1199,7 @@ async def upgrade_download(
 # ─── Library Retag ───────────────────────────────────────────────
 
 async def retag_library(music_dir: str, on_progress=None) -> dict:
-    """Scan all FLAC files, find those missing metadata, fetch from Tidal and retag.
+    """Scan all FLAC files, find those missing metadata, fetch from Tidal + MusicBrainz and retag.
 
     Returns stats: {total, scanned, retagged, failed, skipped, details[]}.
     """
@@ -1182,43 +1220,61 @@ async def retag_library(music_dir: str, on_progress=None) -> dict:
                 details.append({"file": fpath.name, "status": "skipped", "reason": "no artist/title"})
                 continue
 
-            # Check if already has full metadata
+            # Check if already has full metadata (including genre)
             has_date = bool(audio.get("date"))
             has_tracknum = bool(audio.get("tracknumber"))
             has_isrc = bool(audio.get("isrc"))
+            has_genre = bool(audio.get("genre"))
 
-            if has_date and has_tracknum and has_isrc:
+            if has_date and has_tracknum and has_isrc and has_genre:
                 skipped += 1
                 continue
 
-            # Search Tidal for this track
-            query = _clean_query(artist, title)
-            async with _proxy_client(timeout=15) as c:
-                results = await tidal_search(c, query, limit=5, verify_quality=False)
+            needs_tidal = not (has_date and has_tracknum and has_isrc)
+            meta = {}
 
-            if not results:
-                failed += 1
-                details.append({"file": fpath.name, "status": "not_found", "query": query})
-                continue
+            if needs_tidal:
+                # Search Tidal for this track
+                query = _clean_query(artist, title)
+                async with _proxy_client(timeout=15) as c:
+                    results = await tidal_search(c, query, limit=5, verify_quality=False)
 
-            # Find best matching result
-            best = None
-            for r in results:
-                a_match = _fuzzy_match(r.artist, artist)
-                t_match = _fuzzy_match(r.title, title)
-                if a_match >= 0.3 and t_match >= 0.5:
-                    if not _is_non_original(title, r.title, r.version, r.album):
-                        best = r
-                        break
-            if not best:
-                best = results[0]
+                if not results:
+                    failed += 1
+                    details.append({"file": fpath.name, "status": "not_found", "query": query})
+                    # Still try genre from MusicBrainz
+                    if not has_genre:
+                        genre = await _fetch_genre_musicbrainz(artist)
+                        if genre:
+                            tag_flac(str(fpath), extra_meta={"genre": genre})
+                            await asyncio.sleep(1.1)  # MusicBrainz rate limit: 1 req/s
+                    continue
 
-            # Fetch full metadata
-            meta = await _fetch_track_meta(best.track_id)
-            if not meta:
-                failed += 1
-                details.append({"file": fpath.name, "status": "meta_fail", "track_id": best.track_id})
-                continue
+                # Find best matching result
+                best = None
+                for r in results:
+                    a_match = _fuzzy_match(r.artist, artist)
+                    t_match = _fuzzy_match(r.title, title)
+                    if a_match >= 0.3 and t_match >= 0.5:
+                        if not _is_non_original(title, r.title, r.version, r.album):
+                            best = r
+                            break
+                if not best:
+                    best = results[0]
+
+                # Fetch full metadata
+                meta = await _fetch_track_meta(best.track_id)
+                if not meta:
+                    failed += 1
+                    details.append({"file": fpath.name, "status": "meta_fail", "track_id": best.track_id})
+                    continue
+
+            # Fetch genre from MusicBrainz if missing
+            if not has_genre:
+                genre = await _fetch_genre_musicbrainz(artist)
+                if genre:
+                    meta["genre"] = genre
+                await asyncio.sleep(1.1)  # MusicBrainz rate limit
 
             # Apply metadata, keeping existing cover if present
             cover = meta.pop("cover_data", None)
@@ -1233,11 +1289,9 @@ async def retag_library(music_dir: str, on_progress=None) -> dict:
                 extra_meta=meta,
             )
             retagged += 1
-            details.append({
-                "file": fpath.name, "status": "retagged",
-                "added": [k for k in ("date", "tracknumber", "isrc", "copyright", "discnumber")
-                          if meta.get(k) and not audio.get(k.upper())],
-            })
+            added = [k for k in ("date", "tracknumber", "isrc", "copyright", "discnumber", "genre")
+                     if meta.get(k) and not audio.get(k.upper())]
+            details.append({"file": fpath.name, "status": "retagged", "added": added})
 
         except Exception as e:
             failed += 1
