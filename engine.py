@@ -28,9 +28,11 @@ PROXY_URL = os.getenv("PROXY_URL", "")
 
 def _proxy_client(timeout=15, **kwargs) -> httpx.AsyncClient:
     """Create httpx client that routes through the configured proxy."""
-    opts = dict(timeout=timeout, follow_redirects=True, **kwargs)
+    transport = httpx.AsyncHTTPTransport(retries=3)
+    opts = dict(timeout=timeout, follow_redirects=True, transport=transport, **kwargs)
     if PROXY_URL:
         opts["proxy"] = PROXY_URL
+        opts.pop("transport", None)  # proxy incompatible with custom transport
     return httpx.AsyncClient(**opts)
 
 _STOP_WORDS = {
@@ -812,29 +814,46 @@ async def soulseek_download(
     artist: str = "",
     title: str = "",
     timeout: int = 300,
+    file_size: int = 0,
 ) -> DownloadResult | None:
     try:
         r = await slsk_client.post(
             f"/api/v0/transfers/downloads/{username}",
-            json=[{"filename": filename, "size": 0}],
+            json=[{"filename": filename, "size": file_size}],
         )
         if r.status_code not in (200, 201):
             return None
 
-        for _ in range(timeout // 3):
+        short_fn = filename.rsplit("\\", 1)[-1] if "\\" in filename else filename.rsplit("/", 1)[-1]
+        logger.info("[SLSK-DL] Waiting for %s from %s (%s)", short_fn, username, filename)
+        for poll in range(timeout // 3):
             await asyncio.sleep(3)
             r = await slsk_client.get(f"/api/v0/transfers/downloads/{username}")
             if r.status_code != 200:
                 continue
-            transfers = r.json()
-            for tf in transfers:
-                for dl_file in tf.get("files", []):
+            data = r.json()
+            # slskd API: {username, directories: [{directory, files: [{filename, state, ...}]}]}
+            directories = []
+            if isinstance(data, dict):
+                directories = data.get("directories", [])
+            elif isinstance(data, list):
+                directories = data
+            found_file = False
+            for d in directories:
+                files = d.get("files", []) if isinstance(d, dict) else []
+                for dl_file in files:
+                    if not isinstance(dl_file, dict):
+                        continue
                     if dl_file.get("filename") != filename:
                         continue
+                    found_file = True
                     state = dl_file.get("state", "")
+                    pct = dl_file.get("percentComplete", 0)
+                    if poll % 10 == 0:
+                        logger.info("[SLSK-DL] %s@%s: state=%s pct=%s%%", short_fn, username, state, pct)
                     if "Completed" in state and "Succeeded" in state:
-                        short = filename.rsplit("\\", 1)[-1] if "\\" in filename else filename.rsplit("/", 1)[-1]
-                        found = _find_downloaded_file(music_dir, short)
+                        logger.info("[SLSK-DL] ✅ Completed from %s", username)
+                        found = _find_downloaded_file(music_dir, short_fn)
                         if found:
                             dest = _organize_path(music_dir, artist, title)
                             try:
@@ -849,9 +868,14 @@ async def soulseek_download(
                                 sample_rate=sample_rate, stream_type="soulseek",
                                 artist=artist, title=title,
                             )
+                        logger.warning("[SLSK-DL] Completed but file not found on disk: %s", short_fn)
                         return None
-                    elif "Errored" in state or "Cancelled" in state:
+                    elif "Errored" in state or "Cancelled" in state or "Aborted" in state or "TimedOut" in state:
+                        logger.warning("[SLSK-DL] ❌ %s from %s: %s", short_fn, username, state)
                         return None
+            if not found_file and poll > 5:
+                logger.warning("[SLSK-DL] File not found in transfer list for %s", username)
+                return None
     except Exception:
         logger.warning("Soulseek download failed for %s/%s", username, filename, exc_info=True)
     return None
@@ -1058,6 +1082,7 @@ async def _download_source(
                 slsk_client, src.peer, src.filename, music_dir,
                 bit_depth=src.bit_depth, sample_rate=src.sample_rate,
                 artist=artist, title=title,
+                file_size=int(src.size_mb * 1_000_000),
             )
     return None
 
@@ -1163,6 +1188,7 @@ async def upgrade_download(
             slsk_client, src.peer, src.filename, music_dir,
             bit_depth=src.bit_depth, sample_rate=src.sample_rate,
             artist=track["artist"], title=track["title"],
+            file_size=int(src.size_mb * 1_000_000),
         )
 
         if dl and dl.path and Path(dl.path).exists():
