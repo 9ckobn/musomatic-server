@@ -440,6 +440,8 @@ def _scan_library() -> list[dict]:
             "title": title or f.stem,
             "album": album,
             "size_mb": round(f.stat().st_size / 1_000_000, 1),
+            "bit_depth": audio.info.bits_per_sample if audio and audio.info else 0,
+            "sample_rate": audio.info.sample_rate if audio and audio.info else 0,
         })
     _library_cache["data"] = tracks
     _library_cache["ts"] = now
