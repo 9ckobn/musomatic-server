@@ -718,16 +718,22 @@ def get_job(job_id: str):
 
 @app.get("/jobs")
 def list_jobs():
-    return {
-        jid: {
+    out = {}
+    for jid, j in _jobs.items():
+        info = {
             "status": j["status"],
             "started": j.get("started"),
             "artist": j.get("artist", ""),
             "title": j.get("title", ""),
             "error": j.get("error"),
         }
-        for jid, j in _jobs.items()
-    }
+        result = j.get("result")
+        if isinstance(result, dict):
+            info["quality"] = result.get("quality", "")
+            info["album"] = result.get("album", "")
+            info["source"] = result.get("stream_type", "")
+        out[jid] = info
+    return out
 
 
 @app.get("/library/stats")
