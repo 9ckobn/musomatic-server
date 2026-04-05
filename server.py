@@ -383,8 +383,12 @@ def _parse_query(query: str) -> tuple[str, str]:
 
 
 @app.post("/quick")
-async def quick_download(req: QuickDownload):
-    """Synchronous search + download. Designed for iPhone Shortcuts."""
+async def quick_download(req: QuickDownload, bg: BackgroundTasks):
+    """Async search + download. Returns instantly.
+    If track already exists — returns immediately with status 'exists'.
+    Otherwise starts background download, returns job_id.
+    Use GET /jobs/{job_id} to poll progress.
+    ?wait=1 for old sync behavior (CLI usage)."""
     from engine import _find_existing
     artist, title = _parse_query(req.query)
     if not title:
@@ -393,10 +397,8 @@ async def quick_download(req: QuickDownload):
     logger.info("[QUICK-DL] %s - %s", artist or "?", title)
     t0 = time.time()
 
-    # Fast dedup check BEFORE searching — saves 30-50s for existing tracks
-    check_artist = artist or ""
-    check_title = title
-    existing = _find_existing(MUSIC_DIR, check_artist, check_title)
+    # Fast dedup check — instant response for existing tracks
+    existing = _find_existing(MUSIC_DIR, artist or "", title)
     if existing:
         from mutagen.flac import FLAC as FLACInfo
         bd, sr = 16, 44100
@@ -411,43 +413,63 @@ async def quick_download(req: QuickDownload):
         quality = f"Hi-Res {bd}bit/{rate}" if bd >= 24 else f"CD {bd}bit/{rate}"
         return {
             "status": "exists",
-            "message": f"♻️ Already exists {check_artist} — {check_title}\n🎵 {quality}\n💿 \n⏱ {elapsed}s",
-            "artist": check_artist, "title": check_title, "album": "",
+            "message": f"♻️ {artist or '?'} — {title}\n🎵 {quality}",
+            "artist": artist, "title": title, "album": "",
             "quality": quality, "elapsed_s": elapsed,
         }
 
-    results = await search_batch(
-        [{"artist": artist, "title": title}],
-        slskd_url=SLSKD_URL, slskd_key=SLSKD_KEY,
-    )
-    r = results[0]
-    if not r.best:
-        return {
-            "status": "not_found",
-            "message": f"❌ Not found: {artist} — {title}" if artist else f"❌ Not found: {title}",
-        }
-
-    dl = await download_track(r, MUSIC_DIR, SLSKD_URL, SLSKD_KEY)
-    elapsed = round(time.time() - t0, 1)
-
-    if dl:
-        _invalidate_caches()
-        is_dedup = getattr(dl, 'stream_type', '') == 'existing'
-        bd = dl.bit_depth
-        sr = dl.sample_rate
-        rate = f"{sr / 1000:.1f}kHz"
-        quality = f"Hi-Res {bd}bit/{rate}" if bd >= 24 else f"CD {bd}bit/{rate}"
-        prefix = "♻️ Already exists" if is_dedup else "✅"
-        return {
-            "status": "exists" if is_dedup else "done",
-            "message": f"{prefix} {dl.artist} — {dl.title}\n🎵 {quality}\n💿 {dl.album}\n⏱ {elapsed}s",
-            "artist": dl.artist, "title": dl.title, "album": dl.album,
-            "quality": quality, "elapsed_s": elapsed,
-        }
-    return {
-        "status": "failed",
-        "message": f"⚠️ Found but download failed: {artist} — {title}",
+    # Start async download — return immediately
+    _cleanup_jobs()
+    job_id = f"quick-{secrets.token_hex(8)}"
+    _jobs[job_id] = {
+        "status": "searching", "artist": artist, "title": title,
+        "result": None, "error": None, "started": time.time(),
     }
+    _cancel_events[job_id] = asyncio.Event()
+    bg.add_task(_quick_download_job, job_id, artist, title)
+    return {
+        "status": "downloading",
+        "message": f"⬇️ {artist + ' — ' if artist else ''}{title}",
+        "job_id": job_id,
+        "artist": artist, "title": title,
+    }
+
+
+async def _quick_download_job(job_id: str, artist: str, title: str):
+    """Background job for /quick endpoint."""
+    try:
+        results = await search_batch(
+            [{"artist": artist, "title": title}],
+            slskd_url=SLSKD_URL, slskd_key=SLSKD_KEY,
+        )
+        r = results[0]
+        if not r.best:
+            _jobs[job_id]["status"] = "not_found"
+            _jobs[job_id]["error"] = f"Not found: {artist} — {title}" if artist else f"Not found: {title}"
+            return
+
+        _jobs[job_id]["status"] = "downloading"
+        dl = await download_track(r, MUSIC_DIR, SLSKD_URL, SLSKD_KEY)
+
+        if dl:
+            _invalidate_caches()
+            bd = dl.bit_depth
+            sr = dl.sample_rate
+            rate = f"{sr / 1000:.1f}kHz"
+            quality = f"Hi-Res {bd}bit/{rate}" if bd >= 24 else f"CD {bd}bit/{rate}"
+            _jobs[job_id].update({
+                "status": "done", "result": dl,
+                "artist": dl.artist, "title": dl.title,
+                "album": getattr(dl, 'album', ''),
+                "quality": quality,
+            })
+        else:
+            _jobs[job_id]["status"] = "failed"
+            _jobs[job_id]["error"] = "All sources failed"
+    except Exception as e:
+        logger.exception("[QUICK-JOB] %s", e)
+        _jobs[job_id]["status"] = "failed"
+        _jobs[job_id]["error"] = str(e)
 
 
 # ─── Library Management ──────────────────────────────────────────
