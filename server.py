@@ -63,7 +63,7 @@ _recommend_status: dict = {"last_run": None, "last_result": None, "enabled": Fal
 
 async def _upgrader_loop():
     """Background loop: periodically scan for 16→24bit upgrades on Soulseek."""
-    await asyncio.sleep(60)
+    await asyncio.sleep(300)  # Wait 5 minutes before first scan
     while True:
         _upgrade_status["next_run"] = time.time()
         try:
@@ -351,12 +351,36 @@ def _parse_query(query: str) -> tuple[str, str]:
 @app.post("/quick")
 async def quick_download(req: QuickDownload):
     """Synchronous search + download. Designed for iPhone Shortcuts."""
+    from engine import _find_existing
     artist, title = _parse_query(req.query)
     if not title:
         raise HTTPException(400, "Empty query")
 
     logger.info("[QUICK-DL] %s - %s", artist or "?", title)
     t0 = time.time()
+
+    # Fast dedup check BEFORE searching — saves 30-50s for existing tracks
+    check_artist = artist or ""
+    check_title = title
+    existing = _find_existing(MUSIC_DIR, check_artist, check_title)
+    if existing:
+        from mutagen.flac import FLAC as FLACInfo
+        bd, sr = 16, 44100
+        try:
+            info = FLACInfo(existing).info
+            bd = info.bits_per_sample or 16
+            sr = info.sample_rate or 44100
+        except Exception:
+            pass
+        elapsed = round(time.time() - t0, 1)
+        rate = f"{sr / 1000:.1f}kHz"
+        quality = f"Hi-Res {bd}bit/{rate}" if bd >= 24 else f"CD {bd}bit/{rate}"
+        return {
+            "status": "exists",
+            "message": f"♻️ Already exists {check_artist} — {check_title}\n🎵 {quality}\n💿 \n⏱ {elapsed}s",
+            "artist": check_artist, "title": check_title, "album": "",
+            "quality": quality, "elapsed_s": elapsed,
+        }
 
     results = await search_batch(
         [{"artist": artist, "title": title}],

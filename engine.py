@@ -761,7 +761,7 @@ async def tidal_download(
 async def soulseek_search(
     client: httpx.AsyncClient,
     query: str,
-    wait: int = 12,
+    wait: int = 8,
 ) -> list[SourceResult]:
     results = []
     queries_to_try = [query]
@@ -845,9 +845,10 @@ async def soulseek_download(
     sample_rate: int = 44100,
     artist: str = "",
     title: str = "",
-    timeout: int = 300,
+    timeout: int = 60,
     file_size: int = 0,
 ) -> DownloadResult | None:
+    import time as _time
     try:
         r = await slsk_client.post(
             f"/api/v0/transfers/downloads/{username}",
@@ -858,13 +859,14 @@ async def soulseek_download(
 
         short_fn = filename.rsplit("\\", 1)[-1] if "\\" in filename else filename.rsplit("/", 1)[-1]
         logger.info("[SLSK-DL] Waiting for %s from %s (%s)", short_fn, username, filename)
+        queued_polls = 0
+        dl_start_time = None  # when InProgress first detected
         for poll in range(timeout // 3):
             await asyncio.sleep(3)
             r = await slsk_client.get(f"/api/v0/transfers/downloads/{username}")
             if r.status_code != 200:
                 continue
             data = r.json()
-            # slskd API: {username, directories: [{directory, files: [{filename, state, ...}]}]}
             directories = []
             if isinstance(data, dict):
                 directories = data.get("directories", [])
@@ -888,12 +890,36 @@ async def soulseek_download(
                         found = _find_downloaded_file(music_dir, short_fn)
                         if found:
                             dest = _organize_path(music_dir, artist, title)
-                            try:
-                                shutil.move(str(found), dest)
-                                if found.parent != Path(music_dir) and not any(found.parent.iterdir()):
-                                    found.parent.rmdir()
-                            except Exception:
-                                dest = str(found)
+                            # Convert non-FLAC lossless to FLAC
+                            ext = found.suffix.lower()
+                            if ext in (".wav", ".ape", ".wv", ".alac"):
+                                flac_dest = dest  # already ends in .flac
+                                try:
+                                    proc = await asyncio.create_subprocess_exec(
+                                        "ffmpeg", "-y", "-i", str(found),
+                                        "-c:a", "flac", "-compression_level", "8",
+                                        flac_dest,
+                                        stdout=asyncio.subprocess.DEVNULL,
+                                        stderr=asyncio.subprocess.DEVNULL,
+                                    )
+                                    await asyncio.wait_for(proc.wait(), timeout=60)
+                                    if proc.returncode == 0 and Path(flac_dest).exists():
+                                        found.unlink(missing_ok=True)
+                                        logger.info("[SLSK-DL] Converted %s → FLAC", ext)
+                                    else:
+                                        logger.warning("[SLSK-DL] ffmpeg conversion failed for %s", ext)
+                                        found.unlink(missing_ok=True)
+                                        return None
+                                except Exception:
+                                    found.unlink(missing_ok=True)
+                                    return None
+                            else:
+                                try:
+                                    shutil.move(str(found), dest)
+                                    if found.parent != Path(music_dir) and not any(found.parent.iterdir()):
+                                        found.parent.rmdir()
+                                except Exception:
+                                    dest = str(found)
                             tag_flac(dest, artist=artist, title=title, album="")
                             return DownloadResult(
                                 path=dest, bit_depth=bit_depth,
@@ -905,6 +931,25 @@ async def soulseek_download(
                     elif "Errored" in state or "Cancelled" in state or "Aborted" in state or "TimedOut" in state or "Rejected" in state:
                         logger.warning("[SLSK-DL] ❌ %s from %s: %s", short_fn, username, state)
                         return None
+                    # Bail if stuck in queue too long
+                    if "Queued" in state and pct == 0:
+                        queued_polls += 1
+                        if queued_polls >= 5:  # ~15s queued
+                            logger.warning("[SLSK-DL] ⏭ Skipping %s — stuck in queue %ds", username, queued_polls * 3)
+                            return None
+                    else:
+                        queued_polls = 0
+                    # Track download start and bail if too slow
+                    if "InProgress" in state:
+                        if dl_start_time is None:
+                            dl_start_time = _time.monotonic()
+                        else:
+                            dl_elapsed = _time.monotonic() - dl_start_time
+                            # Only bail if projected total > 90s (very slow peer)
+                            if dl_elapsed >= 15 and pct > 0 and pct < 15:
+                                logger.warning("[SLSK-DL] ⏭ Skipping %s — too slow (%.1f%% in %.0fs)",
+                                               username, pct, dl_elapsed)
+                                return None
             if not found_file and poll > 5:
                 logger.warning("[SLSK-DL] File not found in transfer list for %s", username)
                 return None
@@ -1021,7 +1066,7 @@ async def search_batch(
                 async def slsk_one(idx: int, r: UnifiedResult):
                     nonlocal slsk_done
                     async with sem_slsk:
-                        slsk_res = await soulseek_search(slsk_client, r.query, wait=12)
+                        slsk_res = await soulseek_search(slsk_client, r.query, wait=6)
                     r.sources.extend(slsk_res)
                     slsk_done += 1
                     if on_progress and (slsk_done % 10 == 0 or slsk_done == len(slsk_targets)):
@@ -1072,40 +1117,35 @@ async def download_track(
 
     use_source_meta = not orig_artist
 
-    # Quality fallback chain:
-    #   1) Tidal HI_RES_LOSSLESS  (24bit from Monochrome)
-    #   2) Soulseek 24bit         (hi-res from peers)
-    #   3) Soulseek 16bit         (CD lossless from peers)
-    #   4) Tidal LOSSLESS          (CD — may 403 on Monochrome)
-    #   5) Tidal HIGH              (lossy last resort)
+    # SPEED-FIRST download: grab ANY lossless fast, upgrader handles hi-res later.
+    # Monochrome API ONLY serves HI_RES_LOSSLESS (LOSSLESS/HIGH always 403).
+    # Priority: Tidal HI_RES (instant) → Soulseek (FLAC first, smallest first)
     tidal_hires = [s for s in ranked if s.source == "tidal" and s.is_hires]
-    slsk_hires  = [s for s in ranked if s.source == "soulseek" and s.bit_depth >= 24]
-    slsk_cd     = [s for s in ranked if s.source == "soulseek" and s.bit_depth < 24]
-    tidal_other = [s for s in ranked if s.source == "tidal" and not s.is_hires]
+    # Separate FLAC from non-FLAC Soulseek results, sort each by size
+    slsk_flac = sorted(
+        [s for s in ranked if s.source == "soulseek" and s.filename and s.filename.lower().endswith(".flac")],
+        key=lambda s: s.size_mb,
+    )
+    slsk_other = sorted(
+        [s for s in ranked if s.source == "soulseek" and s.filename and not s.filename.lower().endswith(".flac")],
+        key=lambda s: s.size_mb,
+    )
 
     attempt_order: list[tuple[SourceResult, str | None]] = []
-    for s in tidal_hires:
+    # Tier 0: Tidal HI_RES — instant download, best quality
+    for s in tidal_hires[:3]:
         attempt_order.append((s, "HI_RES_LOSSLESS"))
-    for s in slsk_hires:
+    # Tier 1: Soulseek FLAC first, then other lossless
+    for s in slsk_flac[:5]:
         attempt_order.append((s, None))
-    for s in slsk_cd:
+    for s in slsk_other[:2]:
         attempt_order.append((s, None))
-    for s in tidal_other:
-        attempt_order.append((s, "LOSSLESS"))
-    for s in tidal_other[:3]:
-        attempt_order.append((s, "HIGH"))
 
-    tier_names = {0: "Tidal HI_RES", 1: "Soulseek 24bit", 2: "Soulseek 16bit",
-                  3: "Tidal LOSSLESS", 4: "Tidal HIGH"}
-    tier = 0
+    tier_names = {0: "Tidal HI_RES", 1: "Soulseek"}
+    tier = -1
     tidal_fails = 0
     for src, quality_override in attempt_order:
-        # Log tier transitions
-        new_tier = (0 if src.source == "tidal" and quality_override == "HI_RES_LOSSLESS"
-                    else 1 if src.source == "soulseek" and src.bit_depth >= 24
-                    else 2 if src.source == "soulseek"
-                    else 3 if quality_override == "LOSSLESS"
-                    else 4)
+        new_tier = 0 if quality_override == "HI_RES_LOSSLESS" else 1
         if new_tier != tier:
             tier = new_tier
             logger.info("[DL-CHAIN] Tier %d: %s", tier, tier_names.get(tier, "?"))
@@ -1160,13 +1200,14 @@ async def _download_source(
         async with httpx.AsyncClient(
             base_url=slskd_url.rstrip("/"),
             headers={"X-API-Key": slskd_key},
-            timeout=300,
+            timeout=90,
         ) as slsk_client:
             return await soulseek_download(
                 slsk_client, src.peer, src.filename, music_dir,
                 bit_depth=src.bit_depth, sample_rate=src.sample_rate,
                 artist=artist, title=title,
                 file_size=int(src.size_mb * 1_000_000),
+                timeout=60,
             )
     return None
 
@@ -1179,73 +1220,108 @@ async def upgrade_scan(
     slskd_key: str,
     on_progress=None,
 ) -> list[dict]:
-    """Scan 16-bit tracks and search Soulseek for 24-bit upgrades.
-    STRICT matching: only upgrade if exact same track with better quality."""
+    """Scan tracks and search for quality upgrades.
+    Checks: Tidal HI_RES_LOSSLESS first (fast), then Soulseek 24bit.
+    Upgrades: any non-hires → hires, any lossy → lossless."""
     from mutagen.flac import FLAC as FLACFile
 
     upgrades = []
-    tracks_16 = []
+    upgradeable = []
 
     for f in Path(music_dir).rglob("*.flac"):
+        if "_recommendations" in str(f):
+            continue
         try:
             audio = FLACFile(str(f))
             bd = audio.info.bits_per_sample
+            sr = audio.info.sample_rate
             if bd < 24:
                 artist = (audio.get("artist") or [""])[0]
                 title = (audio.get("title") or [""])[0]
                 if artist and title:
-                    tracks_16.append({
+                    upgradeable.append({
                         "path": str(f), "artist": artist, "title": title,
-                        "bit_depth": bd, "sample_rate": audio.info.sample_rate,
+                        "bit_depth": bd, "sample_rate": sr,
                     })
         except Exception:
             continue
 
-    if not tracks_16 or not slskd_url or not slskd_key:
+    if not upgradeable:
         return upgrades
 
-    logger.info("[UPGRADE] Scan: %d tracks at 16-bit", len(tracks_16))
+    logger.info("[UPGRADE] Scan: %d tracks below 24-bit", len(upgradeable))
 
-    async with httpx.AsyncClient(
-        base_url=slskd_url.rstrip("/"),
-        headers={"X-API-Key": slskd_key},
-        timeout=30,
-    ) as slsk_client:
-        for i, track in enumerate(tracks_16):
-            try:
-                query = f"{track['artist']} {track['title']}"
-                results = await soulseek_search(slsk_client, query, wait=10)
+    # Phase 1: Check Tidal HI_RES_LOSSLESS (fast, parallel)
+    async with _proxy_client(timeout=15) as c:
+        sem = asyncio.Semaphore(10)
 
-                for r in results:
-                    if r.bit_depth < 24:
-                        continue
-                    fname_lower = r.title.lower()
-                    a_match = _fuzzy_match(fname_lower, track['artist'])
-                    t_match = _fuzzy_match(fname_lower, track['title'])
-                    if a_match < 0.3 or t_match < 0.3:
-                        continue
-                    if _is_non_original(track['title'], fname_lower):
-                        continue
-                    if _has_penalty_words(fname_lower) and not _has_penalty_words(track['title']):
-                        continue
+        async def check_tidal(track: dict) -> dict | None:
+            query = _clean_query(track["artist"], track["title"])
+            async with sem:
+                results = await tidal_search(c, query, limit=5, verify_quality=True)
+            for r in results:
+                if not r.is_hires:
+                    continue
+                a_match = _fuzzy_match(r.artist, track["artist"])
+                t_match = _fuzzy_match(r.title, track["title"])
+                if a_match >= 0.3 and t_match >= 0.3:
+                    if not _is_non_original(track["title"], r.title, r.version, r.album):
+                        return {"track": track, "upgrade": r, "source": "tidal"}
+            return None
 
-                    upgrades.append({"track": track, "upgrade": r, "index": i})
-                    logger.info("[UPGRADE] Candidate: %s - %s  %dbit→%dbit (%dkHz)",
-                                track["artist"], track["title"],
-                                track["bit_depth"], r.bit_depth, r.sample_rate // 1000)
-                    break
+        tidal_results = await asyncio.gather(
+            *(check_tidal(t) for t in upgradeable), return_exceptions=True,
+        )
+        tidal_found = set()
+        for res in tidal_results:
+            if isinstance(res, dict) and res:
+                upgrades.append(res)
+                tidal_found.add(res["track"]["path"])
+                logger.info("[UPGRADE] Tidal HI_RES: %s - %s",
+                            res["track"]["artist"], res["track"]["title"])
 
-                if on_progress:
-                    on_progress(i + 1, len(tracks_16))
-                if (i + 1) % 10 == 0:
-                    logger.info("[UPGRADE] Progress: %d/%d scanned, %d candidates",
-                                i + 1, len(tracks_16), len(upgrades))
-            except Exception:
-                logger.warning("[UPGRADE] Scan failed for %s - %s", track['artist'], track['title'], exc_info=True)
-                continue
-            await asyncio.sleep(2)
+    # Phase 2: Check Soulseek for tracks not found on Tidal
+    remaining = [t for t in upgradeable if t["path"] not in tidal_found]
+    if remaining and slskd_url and slskd_key:
+        logger.info("[UPGRADE] Checking Soulseek for %d remaining tracks", len(remaining))
+        async with httpx.AsyncClient(
+            base_url=slskd_url.rstrip("/"),
+            headers={"X-API-Key": slskd_key},
+            timeout=30,
+        ) as slsk_client:
+            for i, track in enumerate(remaining):
+                try:
+                    query = f"{track['artist']} {track['title']}"
+                    results = await soulseek_search(slsk_client, query, wait=10)
 
-    logger.info("[UPGRADE] Scan done: %d/%d candidates found", len(upgrades), len(tracks_16))
+                    for r in results:
+                        if r.bit_depth < 24:
+                            continue
+                        fname_lower = r.title.lower()
+                        a_match = _fuzzy_match(fname_lower, track['artist'])
+                        t_match = _fuzzy_match(fname_lower, track['title'])
+                        if a_match < 0.3 or t_match < 0.3:
+                            continue
+                        if _is_non_original(track['title'], fname_lower):
+                            continue
+                        upgrades.append({"track": track, "upgrade": r, "source": "soulseek"})
+                        logger.info("[UPGRADE] Soulseek 24bit: %s - %s  (%dkHz)",
+                                    track["artist"], track["title"], r.sample_rate // 1000)
+                        break
+
+                    if on_progress:
+                        on_progress(i + 1, len(remaining))
+                    if (i + 1) % 10 == 0:
+                        logger.info("[UPGRADE] Soulseek progress: %d/%d scanned",
+                                    i + 1, len(remaining))
+                except Exception:
+                    continue
+                await asyncio.sleep(2)
+
+    logger.info("[UPGRADE] Scan done: %d candidates (%d Tidal, %d Soulseek)",
+                len(upgrades),
+                sum(1 for u in upgrades if u.get("source") == "tidal"),
+                sum(1 for u in upgrades if u.get("source") == "soulseek"))
     return upgrades
 
 
@@ -1255,53 +1331,78 @@ async def upgrade_download(
     slskd_url: str,
     slskd_key: str,
 ) -> DownloadResult | None:
-    """Download upgrade, verify quality, replace old file."""
+    """Download upgrade from Tidal or Soulseek, verify quality, replace old file."""
     track = upgrade["track"]
     src = upgrade["upgrade"]
     old_path = track["path"]
+    source_type = upgrade.get("source", "soulseek")
 
-    if not src.filename or not src.peer:
-        return None
+    dl = None
+    if source_type == "tidal" and src.track_id:
+        # Download from Tidal HI_RES
+        import tempfile
+        tmp_dir = tempfile.mkdtemp(prefix="upgrade_")
+        try:
+            dl = await tidal_download(
+                src.track_id, tmp_dir,
+                artist=track["artist"], title=track["title"],
+                quality="HI_RES_LOSSLESS",
+            )
+        except Exception:
+            logger.warning("[UPGRADE] Tidal download failed for %s", track["title"], exc_info=True)
+            shutil.rmtree(tmp_dir, ignore_errors=True)
+    elif src.filename and src.peer:
+        # Download from Soulseek
+        async with httpx.AsyncClient(
+            base_url=slskd_url.rstrip("/"),
+            headers={"X-API-Key": slskd_key},
+            timeout=120,
+        ) as slsk_client:
+            dl = await soulseek_download(
+                slsk_client, src.peer, src.filename, music_dir,
+                bit_depth=src.bit_depth, sample_rate=src.sample_rate,
+                artist=track["artist"], title=track["title"],
+                file_size=int(src.size_mb * 1_000_000),
+            )
 
-    async with httpx.AsyncClient(
-        base_url=slskd_url.rstrip("/"),
-        headers={"X-API-Key": slskd_key},
-        timeout=300,
-    ) as slsk_client:
-        dl = await soulseek_download(
-            slsk_client, src.peer, src.filename, music_dir,
-            bit_depth=src.bit_depth, sample_rate=src.sample_rate,
-            artist=track["artist"], title=track["title"],
-            file_size=int(src.size_mb * 1_000_000),
-        )
-
-        if dl and dl.path and Path(dl.path).exists():
-            try:
-                from mutagen.flac import FLAC as FLACVerify
-                audio = FLACVerify(dl.path)
-                actual_bd = audio.info.bits_per_sample
-                if actual_bd < 24:
-                    logger.warning("[UPGRADE] %s - %s: claimed 24-bit but got %d-bit, keeping original",
-                                   track["artist"], track["title"], actual_bd)
-                    Path(dl.path).unlink(missing_ok=True)
-                    return None
-            except Exception:
-                logger.warning("[UPGRADE] %s - %s: couldn't verify quality",
-                               track["artist"], track["title"])
+    if dl and dl.path and Path(dl.path).exists():
+        try:
+            from mutagen.flac import FLAC as FLACVerify
+            audio = FLACVerify(dl.path)
+            actual_bd = audio.info.bits_per_sample
+            if actual_bd < 24:
+                logger.warning("[UPGRADE] %s - %s: claimed 24-bit but got %d-bit, keeping original",
+                               track["artist"], track["title"], actual_bd)
                 Path(dl.path).unlink(missing_ok=True)
                 return None
+        except Exception:
+            logger.warning("[UPGRADE] %s - %s: couldn't verify quality",
+                           track["artist"], track["title"])
+            Path(dl.path).unlink(missing_ok=True)
+            return None
 
+        # Move upgraded file to correct location, remove old
+        dest = _organize_path(music_dir, track["artist"], track["title"])
+        if dl.path != dest:
             try:
-                Path(old_path).unlink(missing_ok=True)
-                parent = Path(old_path).parent
-                if parent != Path(music_dir) and parent.exists() and not any(parent.iterdir()):
-                    parent.rmdir()
+                shutil.move(dl.path, dest)
+                dl = DownloadResult(path=dest, bit_depth=dl.bit_depth,
+                                    sample_rate=dl.sample_rate, stream_type=dl.stream_type,
+                                    artist=dl.artist, title=dl.title, album=dl.album)
             except Exception:
                 pass
+        try:
+            if old_path != dest:
+                Path(old_path).unlink(missing_ok=True)
+            parent = Path(old_path).parent
+            if parent != Path(music_dir) and parent.exists() and not any(parent.iterdir()):
+                parent.rmdir()
+        except Exception:
+            pass
 
-            logger.info("[UPGRADE] ✅ Upgraded %s - %s: %dbit → %dbit",
-                        track["artist"], track["title"], track["bit_depth"], actual_bd)
-            return dl
+        logger.info("[UPGRADE] ✅ Upgraded %s - %s: %dbit → %dbit",
+                    track["artist"], track["title"], track["bit_depth"], actual_bd)
+        return dl
 
     return None
 
