@@ -489,25 +489,85 @@ def _normalize_for_match(s: str) -> str:
     return re.sub(r'\s+', ' ', s).strip()
 
 
+_HARMLESS_PAREN_RE = re.compile(
+    r'remaster|hi.?res|\d+.?bit|\d+\s*k?hz|deluxe|stereo|mono|original\s*mix|album|bonus\s*track',
+    re.IGNORECASE,
+)
+
+
+def _slsk_path_matches(filepath: str, artist: str, title: str) -> bool:
+    """Check if a Soulseek file path plausibly matches the requested track.
+    Extracts the actual filename (before normalization) and rejects remix/variant
+    files whose parenthetical suffixes don't appear in the requested title."""
+    if not title:
+        return True
+
+    # Extract raw filename BEFORE normalization (path separators are real here)
+    raw_fn = filepath
+    for sep in ('\\', '/'):
+        if sep in raw_fn:
+            raw_fn = raw_fn.rsplit(sep, 1)[-1]
+    # Strip extension and track-number prefix
+    raw_fn_clean = re.sub(r'\.\w{3,4}$', '', raw_fn)
+    raw_fn_clean = re.sub(r'^\d+[\s._-]+', '', raw_fn_clean)
+
+    norm_fn = _normalize_for_match(raw_fn_clean)
+    norm_title = _normalize_for_match(title)
+    norm_path = _normalize_for_match(filepath)
+
+    title_words = [w for w in norm_title.split() if len(w) > 2]
+    if not title_words:
+        return True
+
+    # All significant title words must appear in the filename
+    matched = sum(1 for w in title_words if w in norm_fn)
+    if matched < max(1, len(title_words) * 0.6):
+        return False
+
+    # Reject remix/variant: parenthetical content in filename not in title
+    fn_parens = re.findall(r'\(([^)]+)\)', raw_fn_clean)
+    title_parens = {p.strip().lower() for p in re.findall(r'\(([^)]+)\)', title)}
+    for paren in fn_parens:
+        paren_lower = paren.strip().lower()
+        if paren_lower in title_parens:
+            continue
+        if _HARMLESS_PAREN_RE.search(paren_lower):
+            continue
+        # Extra non-harmless parenthetical → likely a remix/variant
+        return False
+
+    # If artist provided, at least one significant word should be somewhere in the path
+    if artist:
+        artist_words = [w for w in _normalize_for_match(artist).split() if len(w) > 2]
+        if artist_words and not any(w in norm_path for w in artist_words[:2]):
+            return False
+    return True
+
+
 def _find_existing(music_dir: str, artist: str, title: str) -> str | None:
     """Check if a track with similar artist+title already exists.
-    Checks FLAC metadata first, falls back to filename."""
+    Checks FLAC metadata first, falls back to filename.
+    Requires strong match — all significant title words must be present."""
     norm_a = _normalize_for_match(artist)
     norm_t = _normalize_for_match(title)
+    title_words = [w for w in norm_t.split() if len(w) > 2]
+    if not title_words:
+        return None
     for f in Path(music_dir).rglob("*.flac"):
         try:
             audio = FLAC(str(f))
             meta_artist = _normalize_for_match((audio.get("artist") or [""])[0])
             meta_title = _normalize_for_match((audio.get("title") or [""])[0])
             if meta_title and meta_artist:
-                if (norm_t in meta_title or meta_title in norm_t) and \
-                   (not norm_a or norm_a.split()[0] in meta_artist):
-                    return str(f)
+                # ALL title words must be in metadata title
+                if all(w in meta_title for w in title_words):
+                    if not norm_a or norm_a.split()[0] in meta_artist:
+                        return str(f)
                 continue
         except Exception:
             pass
         fname = _normalize_for_match(f.stem)
-        if norm_t in fname and (not norm_a or norm_a.split()[0] in fname):
+        if all(w in fname for w in title_words) and (not norm_a or norm_a.split()[0] in fname):
             return str(f)
     return None
 
@@ -762,6 +822,8 @@ async def soulseek_search(
     client: httpx.AsyncClient,
     query: str,
     wait: int = 8,
+    artist: str = "",
+    title: str = "",
 ) -> list[SourceResult]:
     results = []
     queries_to_try = [query]
@@ -831,6 +893,12 @@ async def soulseek_search(
                     await client.delete(f"/api/v0/searches/{sid}")
                 except Exception:
                     pass
+
+    # Filter results to match requested artist+title
+    if artist or title:
+        results = [r for r in results if _slsk_path_matches(r.filename or "", artist, title)]
+        if not results:
+            logger.info("[SLSK] No matching results after filtering for '%s - %s'", artist, title)
 
     results.sort(key=lambda r: (r.quality, r.sample_rate, r.size_mb), reverse=True)
     return results[:20]
@@ -1065,8 +1133,19 @@ async def search_batch(
 
                 async def slsk_one(idx: int, r: UnifiedResult):
                     nonlocal slsk_done
+                    # Infer artist/title from Tidal results when not explicitly set
+                    slsk_artist = r.artist
+                    slsk_title = r.title
+                    if not slsk_artist:
+                        tidal_src = next((s for s in r.sources if s.source == "tidal" and s.artist), None)
+                        if tidal_src:
+                            slsk_artist = tidal_src.artist
+                            slsk_title = tidal_src.title or slsk_title
                     async with sem_slsk:
-                        slsk_res = await soulseek_search(slsk_client, r.query, wait=6)
+                        slsk_res = await soulseek_search(
+                            slsk_client, r.query, wait=6,
+                            artist=slsk_artist, title=slsk_title,
+                        )
                     r.sources.extend(slsk_res)
                     slsk_done += 1
                     if on_progress and (slsk_done % 10 == 0 or slsk_done == len(slsk_targets)):
