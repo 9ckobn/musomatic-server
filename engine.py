@@ -73,6 +73,8 @@ _NON_ORIGINAL_RE = re.compile(
     # Live versions
     r'\b(?:live\s+(?:at|from|in|version))\b'
     r'|[\(\[]\s*live(?:\s+(?:at|from|in)\b[^\)\]]*)?[\)\]]'
+    r'|\blive\s+(?:recording|session|performance|concert|album|spirits)\b'
+    r'|\b(?:unplugged|mtv\s+unplugged)\b'
     # Remixes
     r'|[\(\[]\s*[^\)\]]*\s*remix\s*[\)\]]'
     r'|[\(\[]\s*[^\)\]]*\s*mix\s*[\)\]]'
@@ -96,8 +98,10 @@ _NON_ORIGINAL_RE = re.compile(
     r'|\bin\s+the\s+style\s+of\b'
     r'|\bmade\s+famous\s+by\b'
     r'|\bmade\s+popular\s+by\b'
-    # Movie / soundtrack markers in parentheses/brackets
+    r'|\bcover\b'
+    # Movie / soundtrack markers
     r'|[\(\[]\s*from\s+["_\u201c][^\)\]]*[\)\]]'
+    r'|\bsoundtrack\b'
     # Version variants
     r'|[\(\[]\s*(?:karaoke|acoustic|demo|radio|club|instrumental|vocal)\s+version\s*[\)\]]'
     # Remastered
@@ -284,15 +288,19 @@ class UnifiedResult:
                 relevance = a_match + t_match
                 is_original = not _is_non_original(self.title, s.title, s.version, s.album)
             pop = s.popularity / 100.0
+            # Tidal HI_RES tracks are prioritised — Monochrome proxy
+            # currently only serves streams for HI_RES-tagged content
+            tidal_hires = s.source == "tidal" and s.bit_depth >= 24
             return (
                 both_match and no_penalty and is_original,
                 is_original,
                 no_penalty,
+                tidal_hires,
+                s.bit_depth >= 24,
                 pop >= 0.5,
                 relevance >= 1.5,
                 pop,
                 relevance,
-                s.bit_depth >= 24,
                 s.quality,
                 s.sample_rate,
             )
@@ -595,7 +603,12 @@ async def tidal_get_stream(
     track_id: str,
     quality: str = "HI_RES_LOSSLESS",
 ) -> dict | None:
-    for q in [quality, "LOSSLESS", "HIGH"]:
+    # Always try HI_RES_LOSSLESS first — Monochrome proxy often only serves this tier
+    priorities = []
+    for q_opt in ["HI_RES_LOSSLESS", quality, "LOSSLESS", "HIGH"]:
+        if q_opt not in priorities:
+            priorities.append(q_opt)
+    for q in priorities:
         try:
             r = await client.get(
                 f"{MONOCHROME_API}/track/",
@@ -738,67 +751,73 @@ async def soulseek_search(
     wait: int = 12,
 ) -> list[SourceResult]:
     results = []
-    sid = None
-    try:
-        r = await client.post("/api/v0/searches", json={"searchText": query})
-        if r.status_code not in (200, 201):
-            return results
-        sid = r.json().get("id")
-        if not sid:
-            return results
+    queries_to_try = [query]
+    # Fallback: title only (last 1-3 words) — Soulseek AND-matches all words
+    words = query.split()
+    if len(words) >= 3:
+        # Try shorter query (last 2 words likely = title)
+        short = " ".join(words[-2:])
+        if short != query:
+            queries_to_try.append(short)
 
-        await asyncio.sleep(wait)
-
-        rr = await client.get(f"/api/v0/searches/{sid}/responses")
-        for resp in rr.json():
-            username = resp.get("username", "")
-            for f in resp.get("files", []):
-                fname = f.get("filename", "")
-                short = fname.rsplit("\\", 1)[-1] if "\\" in fname else fname.rsplit("/", 1)[-1]
-                ext = short.rsplit(".", 1)[-1].lower() if "." in short else ""
-                sz = f.get("size", 0)
-
-                if ext not in ("flac", "wav", "alac", "ape", "wv"):
-                    continue
-                if sz < 5_000_000:
-                    continue
-
-                path_lower = fname.lower()
-                hires_indicators = [
-                    "24bit", "24-bit", "24 bit", "hi-res", "hires",
-                    "24-96", "24-192", "24-48", "24-44", "[24", "(24",
-                ]
-                is_hires_path = any(ind in path_lower for ind in hires_indicators)
-
-                bd = f.get("bitDepth") or 0
-                sr = f.get("sampleRate") or 0
-                br = f.get("bitRate") or 0
-
-                if bd >= 24 or is_hires_path:
-                    quality = Quality.FLAC_24_HI if (sr or 44100) >= 88200 else Quality.FLAC_24
-                    bit_depth = bd if bd >= 24 else 24
-                    label = f"FLAC {bit_depth}bit{'/' + str(sr) + 'Hz' if sr else ''}"
-                else:
-                    quality = Quality.FLAC_16
-                    bit_depth = bd if bd else 16
-                    label = f"FLAC {bit_depth}bit"
-
-                results.append(SourceResult(
-                    source="soulseek", artist="", title=short,
-                    quality=quality, quality_label=label,
-                    sample_rate=sr or 44100, bit_depth=bit_depth,
-                    bitrate=br, size_mb=sz / 1_000_000,
-                    peer=username, filename=fname, available=True,
-                ))
-
-        if sid:
+    for q in queries_to_try:
+        sid = None
+        try:
+            r = await client.post("/api/v0/searches", json={"searchText": q})
+            if r.status_code not in (200, 201):
+                continue
+            sid = r.json().get("id")
+            if not sid:
+                continue
+            await asyncio.sleep(wait)
+            rr = await client.get(f"/api/v0/searches/{sid}/responses")
+            for resp in rr.json():
+                username = resp.get("username", "")
+                for f in resp.get("files", []):
+                    fname = f.get("filename", "")
+                    short_name = fname.rsplit("\\", 1)[-1] if "\\" in fname else fname.rsplit("/", 1)[-1]
+                    ext = short_name.rsplit(".", 1)[-1].lower() if "." in short_name else ""
+                    sz = f.get("size", 0)
+                    if ext not in ("flac", "wav", "alac", "ape", "wv"):
+                        continue
+                    if sz < 5_000_000:
+                        continue
+                    path_lower = fname.lower()
+                    hires_indicators = [
+                        "24bit", "24-bit", "24 bit", "hi-res", "hires",
+                        "24-96", "24-192", "24-48", "24-44", "[24", "(24",
+                    ]
+                    is_hires_path = any(ind in path_lower for ind in hires_indicators)
+                    bd = f.get("bitDepth") or 0
+                    sr = f.get("sampleRate") or 0
+                    br = f.get("bitRate") or 0
+                    if bd >= 24 or is_hires_path:
+                        quality = Quality.FLAC_24_HI if (sr or 44100) >= 88200 else Quality.FLAC_24
+                        bit_depth = bd if bd >= 24 else 24
+                        label = f"FLAC {bit_depth}bit{'/' + str(sr) + 'Hz' if sr else ''}"
+                    else:
+                        quality = Quality.FLAC_16
+                        bit_depth = bd if bd else 16
+                        label = f"FLAC {bit_depth}bit"
+                    results.append(SourceResult(
+                        source="soulseek", artist="", title=short_name,
+                        quality=quality, quality_label=label,
+                        sample_rate=sr or 44100, bit_depth=bit_depth,
+                        bitrate=br, size_mb=sz / 1_000_000,
+                        peer=username, filename=fname, available=True,
+                    ))
             await client.delete(f"/api/v0/searches/{sid}")
-    except Exception:
-        if sid:
-            try:
-                await client.delete(f"/api/v0/searches/{sid}")
-            except Exception:
-                pass
+            sid = None
+            if results:
+                break  # got results, no need for fallback query
+        except Exception:
+            pass
+        finally:
+            if sid:
+                try:
+                    await client.delete(f"/api/v0/searches/{sid}")
+                except Exception:
+                    pass
 
     results.sort(key=lambda r: (r.quality, r.sample_rate, r.size_mb), reverse=True)
     return results[:20]
@@ -882,14 +901,21 @@ async def soulseek_download(
 
 
 def _find_downloaded_file(music_dir: str, filename: str) -> Path | None:
+    """Search for a downloaded file. slskd always drops files into the root
+    music directory, so also check parent dirs up to /music."""
     import time
-    music_path = Path(music_dir)
-    for p in music_path.rglob(filename):
-        if time.time() - p.stat().st_mtime < 600:
-            return p
-    for p in music_path.rglob(f"*{Path(filename).suffix}"):
-        if p.name == filename:
-            return p
+    search_roots = [Path(music_dir)]
+    # slskd downloads to the root music dir, not subdirs like _recommendations
+    root = Path(os.getenv("MUSIC_DIR", "/music"))
+    if root not in search_roots:
+        search_roots.append(root)
+    for music_path in search_roots:
+        for p in music_path.rglob(filename):
+            if time.time() - p.stat().st_mtime < 600:
+                return p
+        for p in music_path.rglob(f"*{Path(filename).suffix}"):
+            if p.name == filename:
+                return p
     return None
 
 
@@ -1033,16 +1059,60 @@ async def download_track(
 
     use_source_meta = not orig_artist
 
-    for src in ranked[:5]:
+    # Quality fallback chain:
+    #   1) Tidal HI_RES_LOSSLESS  (24bit from Monochrome)
+    #   2) Soulseek 24bit         (hi-res from peers)
+    #   3) Soulseek 16bit         (CD lossless from peers)
+    #   4) Tidal LOSSLESS          (CD — may 403 on Monochrome)
+    #   5) Tidal HIGH              (lossy last resort)
+    tidal_hires = [s for s in ranked if s.source == "tidal" and s.is_hires]
+    slsk_hires  = [s for s in ranked if s.source == "soulseek" and s.bit_depth >= 24]
+    slsk_cd     = [s for s in ranked if s.source == "soulseek" and s.bit_depth < 24]
+    tidal_other = [s for s in ranked if s.source == "tidal" and not s.is_hires]
+
+    attempt_order: list[tuple[SourceResult, str | None]] = []
+    for s in tidal_hires:
+        attempt_order.append((s, "HI_RES_LOSSLESS"))
+    for s in slsk_hires:
+        attempt_order.append((s, None))
+    for s in slsk_cd:
+        attempt_order.append((s, None))
+    for s in tidal_other:
+        attempt_order.append((s, "LOSSLESS"))
+    for s in tidal_other[:3]:
+        attempt_order.append((s, "HIGH"))
+
+    tier_names = {0: "Tidal HI_RES", 1: "Soulseek 24bit", 2: "Soulseek 16bit",
+                  3: "Tidal LOSSLESS", 4: "Tidal HIGH"}
+    tier = 0
+    tidal_fails = 0
+    for src, quality_override in attempt_order:
+        # Log tier transitions
+        new_tier = (0 if src.source == "tidal" and quality_override == "HI_RES_LOSSLESS"
+                    else 1 if src.source == "soulseek" and src.bit_depth >= 24
+                    else 2 if src.source == "soulseek"
+                    else 3 if quality_override == "LOSSLESS"
+                    else 4)
+        if new_tier != tier:
+            tier = new_tier
+            logger.info("[DL-CHAIN] Tier %d: %s", tier, tier_names.get(tier, "?"))
+
+        if src.source == "tidal" and tidal_fails >= 5:
+            continue
         try:
             dl = await _download_source(
                 src, music_dir, slskd_url, slskd_key,
                 orig_artist=orig_artist, orig_title=orig_title,
                 use_source_meta=use_source_meta,
+                quality_override=quality_override,
             )
             if dl:
                 return dl
+            if src.source == "tidal":
+                tidal_fails += 1
         except Exception:
+            if src.source == "tidal":
+                tidal_fails += 1
             continue
     return None
 
@@ -1055,6 +1125,7 @@ async def _download_source(
     orig_artist: str = "",
     orig_title: str = "",
     use_source_meta: bool = False,
+    quality_override: str | None = None,
 ) -> DownloadResult | None:
     if use_source_meta and src.artist:
         artist = src.artist
@@ -1065,7 +1136,7 @@ async def _download_source(
     album = src.album
 
     if src.source == "tidal":
-        quality = "HI_RES_LOSSLESS" if src.is_hires else "LOSSLESS"
+        quality = quality_override or ("HI_RES_LOSSLESS" if src.is_hires else "LOSSLESS")
         return await tidal_download(
             src.track_id, music_dir,
             artist=artist, title=title, album=album,
