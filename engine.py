@@ -104,9 +104,8 @@ _NON_ORIGINAL_RE = re.compile(
     r'|\bsoundtrack\b'
     # Version variants
     r'|[\(\[]\s*(?:karaoke|acoustic|demo|radio|club|instrumental|vocal)\s+version\s*[\)\]]'
-    # Remastered
-    r'|[\(\[]\s*(?:\d{4}\s*[-\u2013\u2014]\s*)?remaster(?:ed)?\s*[\)\]]'
-    r'|[\(\[]\s*\d{4}\s+remaster(?:ed)?\s*[\)\]]'
+    # Remastered — NOT filtered: remasters are the same original track
+    # r'|[\(\[]\s*(?:\d{4}\s*[-\u2013\u2014]\s*)?remaster(?:ed)?\s*[\)\]]'
     # Russian markers
     r'|[\(\[]\s*\u0412\u0435\u0440\u0441\u0438\u044f\s+[^\)\]]*[\)\]]'
     r')'
@@ -685,30 +684,39 @@ async def tidal_download(
         for q in ([quality] if quality == "LOSSLESS" else [quality, "LOSSLESS"]):
             stream = await tidal_get_stream(c, track_id, q)
             if not stream:
+                logger.debug("[TIDAL-DL] No stream for %s q=%s", track_id, q)
                 continue
+            logger.info("[TIDAL-DL] Got %s stream for %s (%dbit/%dHz)",
+                        stream["type"], track_id, stream["bit_depth"], stream["sample_rate"])
             tmp_path = None
             try:
                 if stream["type"] == "direct":
                     async with c.stream("GET", stream["url"]) as resp:
+                        if resp.status_code != 200:
+                            logger.warning("[TIDAL-DL] Direct stream %d for %s", resp.status_code, track_id)
+                            continue
                         with open(fpath, "wb") as f:
                             async for chunk in resp.aiter_bytes(65536):
                                 f.write(chunk)
-                    if Path(fpath).stat().st_size > 1000:
+                    fsize = Path(fpath).stat().st_size
+                    if fsize > 1000:
                         tag_flac(fpath, artist=artist, title=title, album=album,
                                  cover_data=cover_data, extra_meta=track_meta)
+                        logger.info("[TIDAL-DL] ✅ Direct %s → %s (%.1fMB)", track_id, fpath, fsize/1e6)
                         return DownloadResult(
                             path=fpath, bit_depth=stream["bit_depth"],
                             sample_rate=stream["sample_rate"],
                             stream_type="direct", artist=artist, title=title,
                             album=album,
                         )
+                    logger.warning("[TIDAL-DL] File too small: %d bytes", fsize)
 
                 elif stream["type"] == "dash":
                     with tempfile.NamedTemporaryFile(suffix=".mp4", delete=False) as tmp:
                         tmp_path = tmp.name
                         async with c.stream("GET", stream["init_url"]) as resp:
                             if resp.status_code != 200:
-                                raise Exception("init fail")
+                                raise Exception(f"init fail: {resp.status_code}")
                             async for chunk in resp.aiter_bytes(65536):
                                 tmp.write(chunk)
                         for i in range(stream["start_number"],
@@ -716,26 +724,31 @@ async def tidal_download(
                             url = stream["media_template"].replace("$Number$", str(i))
                             async with c.stream("GET", url) as resp:
                                 if resp.status_code != 200:
-                                    raise Exception(f"seg {i} fail")
+                                    raise Exception(f"seg {i} fail: {resp.status_code}")
                                 async for chunk in resp.aiter_bytes(65536):
                                     tmp.write(chunk)
 
+                    tmp_size = Path(tmp_path).stat().st_size
                     result = subprocess.run(
                         ["ffmpeg", "-y", "-i", tmp_path, "-c:a", "copy", fpath],
                         capture_output=True, text=True,
                     )
                     Path(tmp_path).unlink(missing_ok=True)
                     if result.returncode == 0 and Path(fpath).stat().st_size > 1000:
+                        fsize = Path(fpath).stat().st_size
                         tag_flac(fpath, artist=artist, title=title, album=album,
                                  cover_data=cover_data, extra_meta=track_meta)
+                        logger.info("[TIDAL-DL] ✅ DASH %s → %s (%.1fMB)", track_id, fpath, fsize/1e6)
                         return DownloadResult(
                             path=fpath, bit_depth=stream["bit_depth"],
                             sample_rate=stream["sample_rate"],
                             stream_type="dash", artist=artist, title=title,
                             album=album,
                         )
+                    logger.warning("[TIDAL-DL] ffmpeg failed (rc=%d) or tiny file. mp4=%dB stderr=%s",
+                                   result.returncode, tmp_size, result.stderr[:200])
             except Exception:
-                logger.warning("Tidal download failed for track %s (quality=%s)", track_id, q, exc_info=True)
+                logger.warning("[TIDAL-DL] Download failed for %s (q=%s)", track_id, q, exc_info=True)
                 Path(fpath).unlink(missing_ok=True)
                 if tmp_path:
                     Path(tmp_path).unlink(missing_ok=True)
@@ -889,7 +902,7 @@ async def soulseek_download(
                             )
                         logger.warning("[SLSK-DL] Completed but file not found on disk: %s", short_fn)
                         return None
-                    elif "Errored" in state or "Cancelled" in state or "Aborted" in state or "TimedOut" in state:
+                    elif "Errored" in state or "Cancelled" in state or "Aborted" in state or "TimedOut" in state or "Rejected" in state:
                         logger.warning("[SLSK-DL] ❌ %s from %s: %s", short_fn, username, state)
                         return None
             if not found_file and poll > 5:
