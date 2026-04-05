@@ -458,10 +458,10 @@ async def _quick_download_job(job_id: str, artist: str, title: str):
             rate = f"{sr / 1000:.1f}kHz"
             quality = f"Hi-Res {bd}bit/{rate}" if bd >= 24 else f"CD {bd}bit/{rate}"
             _jobs[job_id].update({
-                "status": "done", "result": dl,
+                "status": "done",
                 "artist": dl.artist, "title": dl.title,
                 "album": getattr(dl, 'album', ''),
-                "quality": quality,
+                "quality": quality, "source": dl.stream_type,
             })
         else:
             _jobs[job_id]["status"] = "failed"
@@ -735,7 +735,18 @@ def get_job(job_id: str):
     job = _jobs.get(job_id)
     if not job:
         raise HTTPException(404, "Job not found")
-    return job
+    # Return only JSON-safe fields
+    info = {
+        "status": job["status"],
+        "artist": job.get("artist", ""),
+        "title": job.get("title", ""),
+        "error": job.get("error"),
+        "quality": job.get("quality", ""),
+        "album": job.get("album", ""),
+        "source": job.get("source", ""),
+        "started": job.get("started"),
+    }
+    return info
 
 
 @app.get("/jobs")
