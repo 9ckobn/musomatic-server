@@ -9,6 +9,7 @@ import asyncio
 import contextlib
 import logging
 import os
+import secrets
 import time
 from pathlib import Path
 
@@ -40,7 +41,6 @@ SLSKD_URL = os.getenv("SLSKD_URL", "http://slskd:5030")
 SLSKD_KEY = os.getenv("SLSKD_KEY", "")
 UPGRADE_INTERVAL = int(os.getenv("UPGRADE_INTERVAL", "14400"))  # 4 hours
 API_KEY = os.getenv("API_KEY", "")
-_TRUSTED_NETS = ("127.", "10.", "172.16.", "172.17.", "192.168.")
 
 # AI Recommendations config
 LLM_PROVIDER = os.getenv("LLM_PROVIDER", "")  # openai, deepseek, claude, openrouter
@@ -212,13 +212,12 @@ app = FastAPI(title="Musomatic API", version="2.0", lifespan=lifespan)
 
 @app.middleware("http")
 async def auth_middleware(request: Request, call_next):
-    client = request.client.host if request.client else ""
-    if client and any(client.startswith(p) for p in _TRUSTED_NETS):
-        return await call_next(request)
+    # Health check always public (but returns minimal info)
     if request.url.path == "/health":
         return await call_next(request)
+    # Require API key for all other endpoints
     if API_KEY:
-        key = request.headers.get("x-api-key") or request.query_params.get("key")
+        key = request.headers.get("x-api-key")
         if key != API_KEY:
             return JSONResponse(status_code=401, content={"error": "unauthorized"})
     return await call_next(request)
@@ -295,7 +294,7 @@ class QuickDownload(BaseModel):
 
 @app.get("/health")
 def health():
-    return {"status": "ok", "music_dir": MUSIC_DIR, "tracks_on_disk": _count_flacs()}
+    return {"status": "ok", "tracks": _count_flacs()}
 
 
 @app.post("/search")
@@ -330,7 +329,7 @@ async def search_tracks(req: SearchRequest):
 @app.post("/download")
 async def download_single(req: SingleDownload, bg: BackgroundTasks):
     _cleanup_jobs()
-    job_id = f"dl-{int(time.time())}-{hash(req.artist + req.title) % 10000:04d}"
+    job_id = f"dl-{secrets.token_hex(8)}"
     _jobs[job_id] = {
         "status": "searching", "artist": req.artist, "title": req.title,
         "result": None, "error": None, "started": time.time(),
@@ -472,9 +471,12 @@ def library_delete(req: DeleteRequest):
         return {"status": "not_found", "message": "❌ No matches", "deleted": 0}
 
     deleted = []
-    music = Path(MUSIC_DIR)
+    music = Path(MUSIC_DIR).resolve()
     for t in matches:
-        fp = music / t["path"]
+        fp = (music / t["path"]).resolve()
+        if not str(fp).startswith(str(music)):
+            logger.warning("Path traversal blocked: %s", t["path"])
+            continue
         try:
             fp.unlink()
             parent = fp.parent
@@ -538,7 +540,7 @@ async def batch_download(req: DownloadRequest, bg: BackgroundTasks):
     if len(req.tracks) > 1000:
         raise HTTPException(400, "Batch too large (max 1000)")
     _cleanup_jobs()
-    job_id = f"batch-{int(time.time())}"
+    job_id = f"batch-{secrets.token_hex(8)}"
     _jobs[job_id] = {
         "status": "scanning", "total": len(req.tracks), "done": 0,
         "hires": 0, "cd": 0, "not_found": 0, "downloaded": 0,
@@ -554,7 +556,7 @@ async def batch_download(req: DownloadRequest, bg: BackgroundTasks):
 @app.post("/upgrade/trigger")
 async def trigger_upgrade(bg: BackgroundTasks):
     _cleanup_jobs()
-    job_id = f"upgrade-{int(time.time())}"
+    job_id = f"upgrade-{secrets.token_hex(8)}"
     _jobs[job_id] = {
         "status": "scanning", "started": time.time(),
         "candidates": 0, "upgraded": 0, "failed": 0,
@@ -579,9 +581,8 @@ def upgrade_status():
 # ─── AI Recommendation Endpoints ─────────────────────────────────
 
 class RecommendRequest(BaseModel):
-    provider: str = ""  # override env
-    api_key: str = ""   # override env
-    model: str = ""     # override env
+    provider: str = ""
+    model: str = ""
     count: int = 30
 
 
@@ -589,17 +590,18 @@ class RecommendRequest(BaseModel):
 async def generate_recommendations(req: RecommendRequest, bg: BackgroundTasks):
     """Generate AI recommendations, download them, create Navidrome playlist."""
     provider = req.provider or LLM_PROVIDER
-    api_key = req.api_key or LLM_API_KEY
+    api_key = LLM_API_KEY
     if not provider or not api_key:
-        raise HTTPException(400, "LLM provider and API key required (set LLM_PROVIDER + LLM_API_KEY env vars or pass in request)")
+        raise HTTPException(400, "LLM provider and API key required (set LLM_PROVIDER + LLM_API_KEY env vars)")
+    count = min(req.count, 50)
 
     _cleanup_jobs()
-    job_id = f"recommend-{int(time.time())}"
+    job_id = f"recommend-{secrets.token_hex(8)}"
     _jobs[job_id] = {
         "status": "generating", "started": time.time(),
         "recommended": 0, "downloaded": 0, "playlist_id": None,
     }
-    bg.add_task(_recommend_job, job_id, provider, api_key, req.model or LLM_MODEL, req.count)
+    bg.add_task(_recommend_job, job_id, provider, api_key, req.model or LLM_MODEL, count)
     return {"job_id": job_id, "status": "generating"}
 
 
@@ -633,7 +635,7 @@ async def trigger_cleanup():
 async def retag_all(bg: BackgroundTasks):
     """Re-scan library and fill missing metadata from Tidal."""
     _cleanup_jobs()
-    job_id = f"retag-{int(time.time())}"
+    job_id = f"retag-{secrets.token_hex(8)}"
     _jobs[job_id] = {
         "status": "running", "started": time.time(),
         "progress": 0, "total": 0, "retagged": 0,
