@@ -297,6 +297,41 @@ def health():
     return {"status": "ok", "tracks": _count_flacs()}
 
 
+@app.get("/search/browse")
+async def search_browse(q: str, limit: int = 30):
+    """Browse Tidal catalog — returns matching tracks with quality info."""
+    import httpx as hx
+    proxy = os.getenv("PROXY_URL") or None
+    api_base = os.getenv("MONOCHROME_API", "https://api.monochrome.tf")
+    try:
+        async with hx.AsyncClient(proxy=proxy, timeout=15) as c:
+            r = await c.get(f"{api_base}/search/", params={"s": q, "limit": min(limit, 50)})
+            r.raise_for_status()
+            items = r.json().get("data", {}).get("items", [])
+    except Exception as e:
+        raise HTTPException(502, f"Tidal search failed: {e}")
+
+    results = []
+    for item in items:
+        tags = item.get("mediaMetadata", {}).get("tags", [])
+        if "HIRES_LOSSLESS" in tags:
+            quality = "Hi-Res"
+        elif item.get("audioQuality") == "LOSSLESS" or "LOSSLESS" in tags:
+            quality = "Lossless"
+        else:
+            quality = "Lossy"
+        artist = item.get("artist", {}).get("name", "")
+        results.append({
+            "artist": artist,
+            "title": item.get("title", ""),
+            "album": item.get("album", {}).get("title", ""),
+            "quality": quality,
+            "duration_s": item.get("duration", 0),
+            "version": item.get("version", "") or "",
+        })
+    return {"results": results, "total": len(results)}
+
+
 @app.post("/search")
 async def search_tracks(req: SearchRequest):
     t0 = time.time()
