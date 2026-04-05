@@ -719,7 +719,13 @@ def get_job(job_id: str):
 @app.get("/jobs")
 def list_jobs():
     return {
-        jid: {"status": j["status"], "started": j.get("started")}
+        jid: {
+            "status": j["status"],
+            "started": j.get("started"),
+            "artist": j.get("artist", ""),
+            "title": j.get("title", ""),
+            "error": j.get("error"),
+        }
         for jid, j in _jobs.items()
     }
 
